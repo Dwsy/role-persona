@@ -2,16 +2,83 @@
   "name": "role-persona",
   "version": "1.0.0",
   "type": "module",
-  "description": "Role persona system — memory, knowledge, embedding. Runs as Pi extension, CLI, MCP server, or HTTP daemon.",
-  "bin": {
-    "role-persona": "./src/bin/cli.ts"
+  "description": "Role-based persona system for AI agents — memory, knowledge, embedding. CLI, MCP, daemon, Pi extension.",
+  "author": "Dwsy",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dwsy/role-persona.git"
   },
+  "bugs": {
+    "url": "https://github.com/Dwsy/role-persona/issues"
+  },
+  "homepage": "https://github.com/Dwsy/role-persona#readme",
+  "keywords": [
+    "ai",
+    "agent",
+    "persona",
+    "memory",
+    "knowledge",
+    "embedding",
+    "mcp",
+    "cli",
+    "pi",
+    "role"
+  ],
+  "engines": {
+    "bun": ">=1.0.0",
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "role-persona": "./dist/bin/cli.js"
+  },
+  "main": "./dist/service/index.js",
+  "module": "./dist/service/index.js",
+  "types": "./dist/service/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/service/index.js",
+      "types": "./dist/service/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/bin/cli.js",
+      "types": "./dist/bin/cli.d.ts"
+    },
+    "./daemon": {
+      "import": "./dist/bin/daemon.js",
+      "types": "./dist/bin/daemon.d.ts"
+    },
+    "./mcp": {
+      "import": "./dist/transport/mcp-server.js",
+      "types": "./dist/transport/mcp-server.d.ts"
+    },
+    "./pi-adapter": {
+      "import": "./dist/transport/pi-adapter.js",
+      "types": "./dist/transport/pi-adapter.d.ts"
+    },
+    "./core": {
+      "import": "./dist/core/index.js",
+      "types": "./dist/core/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "templates"
+  ],
   "scripts": {
+    "build": "bun run build:clean && bun run build:cli && bun run build:lib",
+    "build:clean": "rm -rf dist",
+    "build:cli": "bun build ./src/bin/cli.ts --outdir ./dist/bin --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --minify",
+    "build:lib": "bun build ./src/service/index.ts --outdir ./dist/service --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --splitting && bun build ./src/core/index.ts --outdir ./dist/core --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --splitting",
+    "prepublishOnly": "bun run build",
     "cli": "bun src/bin/cli.ts",
     "daemon": "bun src/bin/daemon.ts",
     "mcp": "bun src/transport/mcp-server.ts",
     "test": "bun test",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

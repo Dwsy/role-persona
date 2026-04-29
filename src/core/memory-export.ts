@@ -596,8 +596,12 @@ function generateHtml(tree: TreeNode, allItems: MemoryItem[], roleName: string):
       return div.innerHTML;
     }
 
-    function escapeRegExp(string) {
-      return string.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+    function escapeRegExp(str) {
+
+      var specials = /[.*+?^\${}()|[\]\\]/g;
+
+      return str.replace(specials, function(m) { return "\\" + m; });
+
     }
 
     document.getElementById("search").addEventListener("input", (e) => {
