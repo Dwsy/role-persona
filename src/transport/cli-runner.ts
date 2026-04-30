@@ -1,9 +1,10 @@
 /**
- * CLI Runner — daemon HTTP first, subprocess fallback.
+ * CLI Runner — daemon HTTP first, auto-start, subprocess fallback.
  *
  * Priority:
  *   1. Daemon HTTP (fast, warm, ~5ms)
- *   2. CLI subprocess (slow, cold, ~250ms)
+ *   2. Auto-start daemon + HTTP (first call, ~2s startup)
+ *   3. CLI subprocess (slow, cold, ~250ms)
  *
  * Zero dependency on service/core layers.
  */
@@ -34,8 +35,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const PID_FILE = join(homedir(), ".pi", "role-persona-daemon.pid");
-const PORT_FILE = join(homedir(), ".pi", "role-persona-daemon.port");
+const PI_DIR = join(homedir(), ".pi");
+const PID_FILE = join(PI_DIR, "role-persona-daemon.pid");
+const PORT_FILE = join(PI_DIR, "role-persona-daemon.port");
+const PORT = 3939;
 
 function daemonPort(): number | null {
   try {
@@ -43,8 +46,53 @@ function daemonPort(): number | null {
     const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
     if (isNaN(pid)) return null;
     process.kill(pid, 0); // check alive
-    if (existsSync(PORT_FILE)) return parseInt(readFileSync(PORT_FILE, "utf-8").trim(), 10) || 3939;
-    return 3939;
+    if (existsSync(PORT_FILE)) return parseInt(readFileSync(PORT_FILE, "utf-8").trim(), 10) || PORT;
+    return PORT;
+  } catch {
+    return null;
+  }
+}
+
+// ── Auto-start daemon ──
+
+let _starting = false;
+let _startPromise: Promise<number | null> | null = null;
+
+async function ensureDaemon(): Promise<number | null> {
+  // Already running?
+  const running = daemonPort();
+  if (running) return running;
+
+  // Already starting?
+  if (_starting && _startPromise) return _startPromise;
+
+  _starting = true;
+  _startPromise = startDaemonInBackground();
+  const result = await _startPromise;
+  _starting = false;
+  _startPromise = null;
+  return result;
+}
+
+async function startDaemonInBackground(): Promise<number | null> {
+  try {
+    const proc = spawn("bun", [resolve(__dirname, "../transport/daemon.ts")], {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, PORT: String(PORT) },
+    });
+
+    proc.unref();
+
+    // Wait for PID file to appear (= daemon started)
+    const maxWait = 5000;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      await new Promise((r) => setTimeout(r, 100));
+      const port = daemonPort();
+      if (port) return port;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -103,13 +151,17 @@ function mapArgsToEndpoint(args: string[]): { path: string; body: Record<string,
 // ── Main entry ──
 
 /**
- * Run a CLI command. Tries daemon HTTP first, falls back to subprocess.
+ * Run a CLI command. Daemon HTTP with auto-start, subprocess fallback.
  */
 export async function cli(args: string[], opts: CliOptions = {}): Promise<CliResult> {
   const timeout = opts.timeoutMs || 30000;
 
-  // Try daemon HTTP first
-  const port = daemonPort();
+  // Try daemon HTTP (auto-start if needed)
+  let port = daemonPort();
+  if (!port) {
+    port = await ensureDaemon();
+  }
+
   if (port) {
     const mapped = mapArgsToEndpoint(args);
     if (mapped) {
