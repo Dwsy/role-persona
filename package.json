@@ -1,6 +1,6 @@
 {
   "name": "role-persona",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "Role-based persona system for AI agents — memory, knowledge, embedding. CLI, MCP, daemon, Pi extension.",
   "author": "Dwsy",
