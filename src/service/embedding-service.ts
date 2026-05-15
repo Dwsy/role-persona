@@ -28,7 +28,7 @@ export function createEmbeddingService(ctx: ServiceContext): EmbeddingService {
   return {
     async init(rolePath: string) {
       try {
-        const ok = await initVectorMemory(rolePath, ctx as any);
+        const ok = await initVectorMemory(rolePath, ctx.apiKeyResolver);
         if (ok) {
           log("vector", `vector memory active for role=${ctx.activeRole?.name}`);
         }

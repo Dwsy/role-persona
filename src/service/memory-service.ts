@@ -2,6 +2,7 @@
  * Memory Service — memory CRUD, search, consolidation, maintenance.
  */
 
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type {
   MemoryResult,
@@ -56,6 +57,7 @@ import {
   deleteRolePreference,
   exportMemoryToHtml,
   extractMemoryFacts,
+  type MemoryConflict,
 } from "../core/memory-md.ts";
 import { runAutoMemoryExtraction, runLlmMemoryTidy } from "../core/memory-llm.ts";
 import {
@@ -66,6 +68,18 @@ import {
   getVectorStats,
   autoRecall,
 } from "../core/memory-vector.ts";
+import {
+  buildScenarioPromptBlock,
+  listMemoryScenarios,
+  readMemoryScenario,
+  searchMemoryScenarios,
+  writeMemoryScenario,
+} from "../core/memory-scenarios.ts";
+import type {
+  MemoryScenarioInput,
+  MemoryScenarioRecord,
+  MemoryScenarioSearchMatch,
+} from "../core/types.ts";
 import type { ServiceContext } from "./context.ts";
 import { requireActiveRole, memLogPush } from "./context.ts";
 
@@ -83,13 +97,22 @@ export interface MemoryService {
   repair(force?: boolean): RepairResult;
   tidyLlm(model?: string): Promise<LlmTidyResult | LlmTidyError>;
   exportHtml(outputPath?: string): string;
-  detectConflicts(): ConflictReport;
+  detectConflicts(): { conflicts: MemoryConflict[]; report: string };
   getLog(): MemoryLogEntry[];
   buildEditInstruction(): string;
   readPromptBlocks(): string[];
   loadHighPriority(): string;
   loadOnDemand(query: string, opts?: SearchOpts): OnDemandResult;
   autoRecall(query: string): Promise<string | null>;
+  appendDaily(type: "event" | "lesson" | "preference" | "context" | "decision", content: string): void;
+
+  // Scenario layer (L2)
+  scenarios: {
+    write(input: MemoryScenarioInput): MemoryScenarioRecord;
+    list(): MemoryScenarioRecord[];
+    read(id: string): MemoryScenarioRecord | null;
+    search(query: string, opts?: SearchOpts): MemoryScenarioSearchMatch[];
+  };
 
   // Pending layer
   pending: {
@@ -112,14 +135,93 @@ export interface MemoryService {
 }
 
 export function createMemoryService(ctx: ServiceContext): MemoryService {
+  function readPersistentMemoryLog(): MemoryLogEntry[] {
+    const activeRole = ctx.activeRole?.name;
+    const logDir = join(ctx.rolesDir, ".log");
+    if (!existsSync(logDir)) return [];
+
+    const files = readdirSync(logDir)
+      .filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+      .sort()
+      .slice(-7);
+
+    const entries: Array<MemoryLogEntry & { epoch?: number }> = [];
+    for (const file of files) {
+      const lines = readFileSync(join(logDir, file), "utf-8").split("\n").filter(Boolean);
+      for (const line of lines) {
+        try {
+          const raw = JSON.parse(line) as any;
+          const role = raw.context?.role;
+          const tag = String(raw.tag || "");
+          const message = String(raw.message || "");
+          const isMemoryRelated =
+            tag.includes("memory") ||
+            tag.includes("auto-extract") ||
+            tag.includes("checkpoint") ||
+            tag.includes("llm-tidy") ||
+            tag.includes("consolidate") ||
+            tag.includes("repair") ||
+            tag.includes("search-");
+          if (!isMemoryRelated) continue;
+          if (activeRole && role && role !== "-" && role !== activeRole) continue;
+
+          const date = raw.timestamp ? new Date(raw.timestamp) : new Date(raw.epoch_ms || Date.now());
+          const time = [date.getHours(), date.getMinutes(), date.getSeconds()]
+            .map((n) => String(n).padStart(2, "0"))
+            .join(":");
+          const stored = raw.level !== "error" && !/\b(skip|drop|abort|fail|failed|error)\b/i.test(message);
+          const op = tag === "daily-memory"
+            ? (message.match(/^\[([^\]]+)\]/)?.[1] || "memory")
+            : tag;
+
+          entries.push({
+            time,
+            source: tag.includes("auto-extract") ? "auto-extract" : tag.includes("checkpoint") ? "compaction" : "tool",
+            op: op as any,
+            content: message.replace(/^\[[^\]]+\]\s*/, ""),
+            stored,
+            detail: tag,
+            epoch: raw.epoch_ms || date.getTime(),
+          });
+        } catch {
+          // Ignore malformed log lines.
+        }
+      }
+    }
+
+    return entries
+      .sort((a, b) => (a.epoch || 0) - (b.epoch || 0))
+      .slice(-50)
+      .map(({ epoch: _epoch, ...entry }) => entry);
+  }
+
+  const scenarioOps = {
+    write(input: MemoryScenarioInput) {
+      const { path: rolePath } = requireActiveRole(ctx);
+      return writeMemoryScenario(rolePath, input);
+    },
+    list() {
+      const { path: rolePath } = requireActiveRole(ctx);
+      return listMemoryScenarios(rolePath);
+    },
+    read(id: string) {
+      const { path: rolePath } = requireActiveRole(ctx);
+      return readMemoryScenario(rolePath, id);
+    },
+    search(query: string, opts?: SearchOpts) {
+      const { path: rolePath } = requireActiveRole(ctx);
+      return searchMemoryScenarios(rolePath, query, opts?.maxResults || 3, opts?.minScore || 0.25);
+    },
+  };
+
   const pendingOps = {
     list() {
-      const { rolePath } = requireActiveRole(ctx);
+      const { path: rolePath } = requireActiveRole(ctx);
       return getPendingMemories(rolePath);
     },
     promote(id: string) {
       const { path: rolePath, name: roleName } = requireActiveRole(ctx);
-      return promotePendingLearning(rolePath, id);
+      return promotePendingLearning(rolePath, roleName, id);
     },
     discard(id: string) {
       const { path: rolePath } = requireActiveRole(ctx);
@@ -142,12 +244,16 @@ export function createMemoryService(ctx: ServiceContext): MemoryService {
   };
 
   return {
+    scenarios: scenarioOps,
     pending: pendingOps,
 
     async addLearning(content: string, opts?: AddMemoryOpts) {
       const { path: rolePath, name: roleName } = requireActiveRole(ctx);
-      const result = await addRoleLearningWithTags(ctx as any, rolePath, roleName, content, {
+      const result = await addRoleLearningWithTags(rolePath, roleName, content, {
         appendDaily: true,
+        registry: ctx.modelRegistry,
+        currentModel: ctx.currentModel,
+        llmCaller: ctx.llm,
         ...opts,
       });
       memLogPush(ctx, { source: "tool", op: "learning", content, stored: result.stored, detail: result.reason });
@@ -230,7 +336,7 @@ export function createMemoryService(ctx: ServiceContext): MemoryService {
 
     async tidyLlm(model?: string) {
       const { path: rolePath, name: roleName } = requireActiveRole(ctx);
-      return runLlmMemoryTidy(rolePath, roleName, ctx as any, model);
+      return runLlmMemoryTidy(rolePath, roleName, ctx.modelRegistry!, ctx.currentModel, ctx.llm, model);
     },
 
     exportHtml(outputPath?: string) {
@@ -248,7 +354,9 @@ export function createMemoryService(ctx: ServiceContext): MemoryService {
     },
 
     getLog() {
-      return ctx.memoryLog as MemoryLogEntry[];
+      const persistent = readPersistentMemoryLog();
+      const inMemory = ctx.memoryLog as MemoryLogEntry[];
+      return [...persistent, ...inMemory].slice(-50);
     },
 
     buildEditInstruction() {
@@ -268,20 +376,30 @@ export function createMemoryService(ctx: ServiceContext): MemoryService {
 
     loadOnDemand(query: string, opts?: SearchOpts) {
       const { path: rolePath, name: roleName } = requireActiveRole(ctx);
-      return loadMemoryOnDemand(rolePath, roleName, query, {
+      const base = loadMemoryOnDemand(rolePath, roleName, query, {
         maxResults: opts?.maxResults || 10,
         minScore: opts?.minScore || 0.3,
         includeHighPriority: true,
       });
+      const scenarioBlock = buildScenarioPromptBlock(
+        searchMemoryScenarios(rolePath, query, 3, Math.max(opts?.minScore || 0.25, 0.25))
+      );
+      const content = [base.content, scenarioBlock].filter(Boolean).join("\n\n---\n\n");
+      return { content, matchCount: base.matchCount + (scenarioBlock ? 1 : 0) };
     },
 
     async autoRecall(query: string) {
       return autoRecall(query, ctx.config.vectorMemory?.recallLimit || 5, ctx.config.vectorMemory?.recallMinScore || 0.3);
     },
 
+    appendDaily(type: "event" | "lesson" | "preference" | "context" | "decision", content: string) {
+      const { path: rolePath } = requireActiveRole(ctx);
+      appendDailyRoleMemory(rolePath, type, content);
+    },
+
     async autoExtract(messages: Message[], opts?) {
       const { path: rolePath, name: roleName } = requireActiveRole(ctx);
-      return runAutoMemoryExtraction(roleName, rolePath, ctx as any, messages as any, {
+      return runAutoMemoryExtraction(roleName, rolePath, ctx.modelRegistry!, ctx.currentModel, messages as any, ctx.llm, {
         enabled: ctx.config.autoMemory.enabled,
         model: ctx.config.autoMemory.model,
         maxItems: opts?.maxItems || ctx.config.autoMemory.maxItems,

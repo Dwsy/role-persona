@@ -8,6 +8,9 @@ import type {
   RolePersonaConfig,
   LlmCaller,
   EmbeddingProvider,
+  ModelRegistry,
+  ModelInfo,
+  ApiKeyResolver,
 } from "../core/types.ts";
 
 export interface ServiceContext {
@@ -23,11 +26,26 @@ export interface ServiceContext {
   /** Optional LLM caller for auto-extraction / tidy */
   llm?: LlmCaller;
 
+  /** Optional model registry for model resolution */
+  modelRegistry?: ModelRegistry;
+
+  /** Current session model (null if unknown) */
+  currentModel: ModelInfo | null;
+
+  /** Optional API key resolver for vector memory */
+  apiKeyResolver?: ApiKeyResolver;
+
   /** Optional embedding provider */
   embeddingProvider?: EmbeddingProvider;
 
   /** Whether vector memory is currently active */
   embeddingActive: boolean;
+
+  /** Whether this is the first user message in the session (for on-demand search) */
+  isFirstUserMessage: boolean;
+
+  /** Current working directory (for external readonly scope) */
+  cwd: string;
 
   /** Log entries from this session */
   memoryLog: Array<{

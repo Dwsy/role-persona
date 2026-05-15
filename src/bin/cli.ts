@@ -135,6 +135,10 @@ async function proxyToDaemon(cmd: string, sub: string, args: string[]): Promise<
           case "delete-preference": path = "/api/memory/delete-preference"; body = { needle: args[0] }; break;
           case "reinforce": path = "/api/memory/reinforce"; body = { needle: args[0] }; break;
           case "search": path = "/api/memory/search"; body = { query: args[0] }; break;
+          case "scenario-write": path = "/api/memory/scenario/write"; body = { title: parseFlag(args, "--title") || args[0], guidance: parseFlag(args, "--guidance") || args[1], triggers: parseFlag(args, "--triggers")?.split(","), evidence: parseFlag(args, "--evidence")?.split(","), scope: parseFlag(args, "--scope") }; break;
+          case "scenario-list": path = "/api/memory/scenario/list"; break;
+          case "scenario-read": path = "/api/memory/scenario/read"; body = { id: args[0] }; break;
+          case "scenario-search": path = "/api/memory/scenario/search"; body = { query: args[0], maxResults: Number(parseFlag(args, "--max") || 3), minScore: Number(parseFlag(args, "--min-score") || 0.25) }; break;
           case "list": path = "/api/memory/list"; break;
           case "consolidate": path = "/api/memory/consolidate"; break;
           case "repair": path = "/api/memory/repair"; break;
@@ -205,6 +209,22 @@ async function cmdMemoryDirect(svc: RolePersonaService, sub: string, args: strin
     case "delete-preference": { ok(svc.memory.deletePreference(args[0])); break; }
     case "reinforce": { ok(svc.memory.reinforce(args[0])); break; }
     case "search": { ok(await svc.memory.search(args[0])); break; }
+    case "scenario-write": {
+      const title = parseFlag(args, "--title") || args[0];
+      const guidance = parseFlag(args, "--guidance") || args[1];
+      if (!title || !guidance) fail("Usage: memory scenario-write --title <title> --guidance <guidance> [--triggers a,b] [--evidence ref] [--scope role]");
+      ok(svc.memory.scenarios.write({
+        title,
+        guidance,
+        scope: parseFlag(args, "--scope"),
+        triggers: parseFlag(args, "--triggers")?.split(",").map((s) => s.trim()).filter(Boolean),
+        evidence: parseFlag(args, "--evidence")?.split(",").map((s) => s.trim()).filter(Boolean),
+      }));
+      break;
+    }
+    case "scenario-list": { ok(svc.memory.scenarios.list()); break; }
+    case "scenario-read": { const r = svc.memory.scenarios.read(args[0]); if (!r) fail("Scenario not found"); ok(r); break; }
+    case "scenario-search": { ok(svc.memory.scenarios.search(args[0] || "", { maxResults: Number(parseFlag(args, "--max") || 3), minScore: Number(parseFlag(args, "--min-score") || 0.25) })); break; }
     case "list": { ok(svc.memory.list()); break; }
     case "consolidate": { ok(svc.memory.consolidate()); break; }
     case "repair": { ok(svc.memory.repair(true)); break; }
@@ -248,7 +268,22 @@ async function main() {
   const cwdFlag = parseFlag(rawArgs, "--cwd");
   if (cwdFlag) process.chdir(cwdFlag);
 
-  const args = rawArgs.filter((a) => a !== "--human" && a !== "--json" && a !== "--cwd" && a !== cwdFlag && a !== "--direct");
+  const args = rawArgs.filter((a) => a !== "--human" && a !== "--json" && a !== "--cwd" && a !== cwdFlag && a !== "--direct" && a !== "--web" && a !== "--port");
+
+  // --web flag: start unified daemon + Web UI on one port
+  if (hasFlag(rawArgs, "--web")) {
+    const port = parseInt(parseFlag(rawArgs, "--port") || "3939", 10);
+    if (!isDaemonRunning()) {
+      if (HUMAN) process.stderr.write("Starting daemon + web UI...\n");
+      const result = await startDaemonBackground(port);
+      if (!result.ok && !result.error?.includes("already running")) {
+        fail(`Failed to start daemon: ${result.error}`);
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    ok({ url: `http://localhost:${readPort()}`, port: readPort() }, `Web UI: http://localhost:${readPort()}`);
+    return;
+  }
 
   if (args.length === 0 || args[0] === "--help" || args[0] === "-h") {
     ok({
@@ -258,11 +293,19 @@ async function main() {
         init: "Initialize roles directory",
         "role list|create|info|map|unmap": "Role management",
         "memory add-learning|search|list|consolidate|repair|tidy|export|conflicts|log|build-prompt|extract-memory|flush": "Memory management",
+        "memory scenario-write|scenario-list|scenario-read|scenario-search": "L2 scenario memory",
         "knowledge list|search|read|write": "Knowledge base",
         "embedding stats|rebuild": "Vector memory",
         prompt: "Output system prompt",
       },
-      flags: { "--json": "JSON output (default)", "--human": "Human-readable", "--cwd": "Override CWD", "--direct": "Skip daemon, run directly" },
+      flags: {
+        "--json": "JSON output (default)",
+        "--human": "Human-readable",
+        "--cwd": "Override CWD",
+        "--direct": "Skip daemon, run directly",
+        "--web": "Start unified daemon + web UI (default port 3939)",
+        "--port N": "Port for daemon + web UI",
+      },
     });
     return;
   }

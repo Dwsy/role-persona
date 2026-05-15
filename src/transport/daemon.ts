@@ -16,11 +16,12 @@
  *   kill $(cat ~/.pi/role-persona-daemon.pid)     # stop
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from "node:fs";
+import { join, extname } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
-import { createService, type RolePersonaService } from "../service/index.ts";
+import { createService, type RolePersonaService, type ServiceOptions } from "../service/index.ts";
+import type { LlmCaller, LlmCompletionResult, ModelRegistry, ModelInfo, ApiKeyResolver } from "../core/types.ts";
 
 // ── Config ──
 
@@ -28,6 +29,21 @@ const DAEMON_DIR = join(homedir(), ".pi");
 const PID_FILE = join(DAEMON_DIR, "role-persona-daemon.pid");
 const PORT_FILE = join(DAEMON_DIR, "role-persona-daemon.port");
 const DEFAULT_PORT = 3939;
+const DEFAULT_STATIC_DIR = join(import.meta.dir || ".", "../../web/dist");
+
+const MIME_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
 
 const CORS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -80,7 +96,49 @@ function json(data: unknown, status = 200): Response {
 }
 
 function errResponse(e: unknown, status = 500): Response {
-  return json({ ok: false, error: e instanceof Error ? e.message : String(e) }, status);
+  const msg = e instanceof Error ? e.message : String(e);
+  const code = status === 400 ? "BAD_REQUEST" : status === 403 ? "FORBIDDEN" : status === 404 ? "NOT_FOUND" : "INTERNAL";
+  return json({ ok: false, error: { code, message: msg } }, status);
+}
+
+function badRequest(msg: string) {
+  return json({ ok: false, error: { code: "BAD_REQUEST", message: msg } }, 400);
+}
+
+function notFound(msg: string) {
+  return json({ ok: false, error: { code: "NOT_FOUND", message: msg } }, 404);
+}
+
+function forbidden(msg: string) {
+  return json({ ok: false, error: { code: "FORBIDDEN", message: msg } }, 403);
+}
+
+function internal(msg: string) {
+  return json({ ok: false, error: { code: "INTERNAL", message: msg } }, 500);
+}
+
+function serveStatic(req: Request): Response {
+  const url = new URL(req.url);
+  const requested = decodeURIComponent(url.pathname).replace(/^\/+/, "") || "index.html";
+  let filePath = join(DEFAULT_STATIC_DIR, requested);
+
+  if (!filePath.startsWith(DEFAULT_STATIC_DIR)) return forbidden("Path escape blocked");
+  if (!existsSync(filePath)) filePath = join(DEFAULT_STATIC_DIR, "index.html");
+
+  if (!existsSync(filePath)) {
+    return new Response("Web UI not built. Run: cd web && bun run build", {
+      status: 404,
+      headers: { "Content-Type": "text/plain; charset=utf-8", ...CORS },
+    });
+  }
+
+  try {
+    return new Response(readFileSync(filePath), {
+      headers: { "Content-Type": MIME_TYPES[extname(filePath)] || "application/octet-stream", ...CORS },
+    });
+  } catch (e) {
+    return errResponse(e);
+  }
 }
 
 async function readBody<T>(req: Request): Promise<T> {
@@ -88,129 +146,424 @@ async function readBody<T>(req: Request): Promise<T> {
   return (text ? JSON.parse(text) : {}) as T;
 }
 
-function buildRoutes(service: RolePersonaService): Map<string, (req: Request) => Promise<Response>> {
+// ── LLM Support (reads models.json, uses fetch) ──
+
+interface ModelsJsonProvider {
+  baseUrl: string;
+  apiKey: string;
+  api: string;
+  models: Array<{ id: string; name: string; contextWindow?: number; maxTokens?: number }>;
+}
+
+function loadModelsJson(): Record<string, ModelsJsonProvider> {
+  try {
+    const path = join(homedir(), ".pi", "agent", "models.json");
+    if (!existsSync(path)) return {};
+    return JSON.parse(readFileSync(path, "utf-8")).providers || {};
+  } catch { return {}; }
+}
+
+function createDaemonModelRegistry(): ModelRegistry {
+  const providers = loadModelsJson();
+  const allModels: ModelInfo[] = [];
+  for (const [provName, prov] of Object.entries(providers)) {
+    for (const m of prov.models) {
+      allModels.push({
+        provider: provName,
+        id: m.id,
+        name: m.name,
+        maxTokens: m.maxTokens,
+        contextWindow: m.contextWindow,
+        baseUrl: prov.baseUrl,
+        apiKey: prov.apiKey,
+        api: prov.api,
+      } as any);
+    }
+  }
+  return {
+    getAll: () => allModels,
+    async getApiKeyAndHeaders(model: ModelInfo) {
+      const prov = providers[(model as any).provider || model.provider];
+      if (!prov) return { ok: false };
+      return { ok: true, apiKey: prov.apiKey };
+    },
+  };
+}
+
+function createDaemonApiKeyResolver(): ApiKeyResolver {
+  const providers = loadModelsJson();
+  return {
+    async resolve(provider?: string) {
+      const target = provider ? providers[provider] : providers["openai"];
+      return target?.apiKey || process.env.OPENAI_API_KEY || null;
+    },
+  };
+}
+
+function createDaemonLlmCaller(): LlmCaller {
+  return {
+    async complete(model, request, options) {
+      const prov = (model as any).provider;
+      const providers = loadModelsJson();
+      const providerCfg = providers[prov];
+      if (!providerCfg) throw new Error(`Provider not found: ${prov}`);
+
+      const url = `${providerCfg.baseUrl}/chat/completions`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${options.apiKey || providerCfg.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: model.id,
+          messages: request.messages.map((m) => ({ role: m.role, content: m.content.map((c) => c.text).join("") })),
+          max_tokens: options.maxTokens || 1024,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text().catch(() => "unknown");
+        throw new Error(`LLM call failed (${response.status}): ${err}`);
+      }
+
+      const data = await response.json() as any;
+      const text = data.choices?.[0]?.message?.content || "";
+      return {
+        content: [{ type: "text", text }],
+        stopReason: data.choices?.[0]?.finish_reason === "stop" ? "stop" : "error",
+      } as LlmCompletionResult;
+    },
+
+    convertToLlm(messages: unknown[]) {
+      return (messages as any[]).map((m: any) => ({
+        role: m.role,
+        content: Array.isArray(m.content)
+          ? m.content.map((c: any) => ({ type: c.type || "text", text: c.text || "" }))
+          : [{ type: "text", text: String(m.content || "") }],
+      }));
+    },
+
+    serializeConversation(messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>) {
+      return messages.map((m) => {
+        const text = m.content.map((c) => c.text || "").join("");
+        return `[${m.role}]: ${text}`;
+      }).join("\n\n");
+    },
+  };
+}
+
+// ── Service Manager (CWD multiplexing) ──
+
+const normalize = (p: string) => p.replace(/\/$/, "");
+
+class ServiceManager {
+  private instances = new Map<string, { service: RolePersonaService; lastUsed: number }>();
+  private opts: ServiceOptions;
+  private maxIdleMs = 30 * 60 * 1000;
+
+  constructor(opts: ServiceOptions) {
+    this.opts = opts;
+    setInterval(() => this.cleanup(), 60_000);
+  }
+
+  /** Get service by CWD (resolves role from mapping) or by role name (direct activate) */
+  async get(cwdOrRole: string): Promise<RolePersonaService> {
+    const key = normalize(cwdOrRole);
+    let entry = this.instances.get(key);
+    if (!entry) {
+      const service = createService(this.opts);
+      // If looks like a path (contains /), init with CWD. Otherwise activate role directly.
+      if (key.includes("/") || key.includes("\\")) {
+        await service.init(key);
+      } else {
+        // Direct role activation — init with homedir first, then activate
+        await service.init(homedir());
+        try { service.role.activate(key); } catch {}
+      }
+      entry = { service, lastUsed: Date.now() };
+      this.instances.set(key, entry);
+      console.log(`[daemon] +instance key=${key} role=${service.getActiveRole()?.name ?? "none"}`);
+    }
+    entry.lastUsed = Date.now();
+    return entry.service;
+  }
+
+  list(): Array<{ key: string; role: string | null }> {
+    return [...this.instances.entries()].map(([key, e]) => ({
+      key,
+      role: e.service.getActiveRole()?.name ?? null,
+    }));
+  }
+
+  private cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.instances) {
+      if (now - entry.lastUsed > this.maxIdleMs) {
+        entry.service.dispose().catch(() => {});
+        this.instances.delete(key);
+        console.log(`[daemon] -instance idle cwd=${key}`);
+      }
+    }
+  }
+
+  async dispose() {
+    for (const [, entry] of this.instances) {
+      await entry.service.dispose().catch(() => {});
+    }
+    this.instances.clear();
+  }
+}
+
+function buildRoutes(mgr: ServiceManager): Map<string, (req: Request) => Promise<Response>> {
   const r = new Map<string, (req: Request) => Promise<Response>>();
 
+  // Helper: read body once, extract role, get service
+  async function get(body: any): Promise<RolePersonaService> {
+    return mgr.get(body.role || body.cwd || process.cwd());
+  }
+
   r.set("GET /api/health", async () => {
-    return json({ ok: true, pid: process.pid, uptime: process.uptime(), role: service.getActiveRole()?.name ?? null });
+    return json({ ok: true, pid: process.pid, uptime: process.uptime(), instances: mgr.list() });
+  });
+  r.set("GET /api/instances", async () => json({ ok: true, data: mgr.list() }));
+
+  // ── CWD/Role ──
+  r.set("POST /api/cwd", async (req) => {
+    const b = await readBody<{cwd?: string; role?: string}>(req);
+    const key = b.role || b.cwd;
+    if (!key) return badRequest("cwd or role required");
+    const s = await mgr.get(key);
+    return json({ ok: true, data: { key, role: s.getActiveRole()?.name ?? null } });
+  });
+  r.set("POST /api/init", async (req) => {
+    const b = await readBody<any>(req);
+    const s = await get(b);
+    return json({ ok: true, data: { role: s.getActiveRole()?.name ?? null } });
   });
 
   // ── Role ──
-  r.set("POST /api/init", async (req) => {
-    const { cwd } = await readBody<{ cwd: string }>(req);
-    return json({ ok: true, data: await service.init(cwd) });
-  });
-  r.set("POST /api/role/list", async () => json({ ok: true, data: service.role.list() }));
-  r.set("POST /api/role/create", async (req) => {
-    const { name } = await readBody<{ name: string }>(req);
-    return name ? json({ ok: true, data: service.role.create(name) }) : errResponse("name required", 400);
-  });
-  r.set("POST /api/role/activate", async (req) => {
-    const { name } = await readBody<{ name: string }>(req);
-    return name ? json({ ok: true, data: service.role.activate(name) }) : errResponse("name required", 400);
-  });
-  r.set("POST /api/role/info", async () => {
-    const role = service.getActiveRole();
-    return json({ ok: true, data: role });
-  });
-  r.set("POST /api/role/map", async (req) => {
-    const { cwd, name } = await readBody<{ cwd: string; name: string }>(req);
-    return (cwd && name) ? json({ ok: true, data: service.role.map(cwd, name) }) : errResponse("cwd+name required", 400);
-  });
-  r.set("POST /api/role/unmap", async (req) => {
-    const { cwd } = await readBody<{ cwd: string }>(req);
-    return cwd ? json({ ok: true, data: service.role.unmap(cwd) }) : errResponse("cwd required", 400);
-  });
+  r.set("POST /api/role/list", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.role.list() }); });
+  r.set("POST /api/role/create", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.name ? json({ ok: true, data: s.role.create(b.name) }) : badRequest("name required"); });
+  r.set("POST /api/role/activate", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.name ? json({ ok: true, data: s.role.activate(b.name) }) : badRequest("name required"); });
+  r.set("POST /api/role/info", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.getActiveRole() }); });
+  r.set("POST /api/role/map", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.name ? json({ ok: true, data: s.role.map(b.cwd || process.cwd(), b.name) }) : badRequest("name required"); });
+  r.set("POST /api/role/unmap", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.role.unmap(b.cwd || process.cwd()) }); });
 
   // ── Memory ──
-  r.set("POST /api/memory/add-learning", async (req) => {
-    const { content } = await readBody<{ content: string }>(req);
-    return content ? json({ ok: true, data: await service.memory.addLearning(content) }) : errResponse("content required", 400);
+  r.set("POST /api/memory/add-learning", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.content ? json({ ok: true, data: await s.memory.addLearning(b.content) }) : badRequest("content required"); });
+  r.set("POST /api/memory/add-preference", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.content ? json({ ok: true, data: s.memory.addPreference(b.content, b.category) }) : badRequest("content required"); });
+  r.set("POST /api/memory/update-learning", async (req) => { const b = await readBody<any>(req); const s = await get(b); return (b.needle && b.text) ? json({ ok: true, data: s.memory.updateLearning(b.needle, b.text) }) : badRequest("needle+text required"); });
+  r.set("POST /api/memory/update-preference", async (req) => { const b = await readBody<any>(req); const s = await get(b); return (b.needle && b.text) ? json({ ok: true, data: s.memory.updatePreference(b.needle, b.text, b.category) }) : badRequest("needle+text required"); });
+  r.set("POST /api/memory/delete-learning", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.needle ? json({ ok: true, data: s.memory.deleteLearning(b.needle) }) : badRequest("needle required"); });
+  r.set("POST /api/memory/delete-preference", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.needle ? json({ ok: true, data: s.memory.deletePreference(b.needle) }) : badRequest("needle required"); });
+  r.set("POST /api/memory/reinforce", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.needle ? json({ ok: true, data: s.memory.reinforce(b.needle) }) : badRequest("needle required"); });
+  r.set("POST /api/memory/search", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.query ? json({ ok: true, data: await s.memory.search(b.query) }) : badRequest("query required"); });
+  r.set("POST /api/memory/scenario/write", async (req) => {
+    const b = await readBody<any>(req);
+    const s = await get(b);
+    return (b.title && b.guidance)
+      ? json({ ok: true, data: s.memory.scenarios.write({ title: b.title, guidance: b.guidance, triggers: b.triggers, evidence: b.evidence, scope: b.scope }) })
+      : badRequest("title+guidance required");
   });
-  r.set("POST /api/memory/add-preference", async (req) => {
-    const { content, category } = await readBody<{ content: string; category?: string }>(req);
-    return content ? json({ ok: true, data: service.memory.addPreference(content, category) }) : errResponse("content required", 400);
-  });
-  r.set("POST /api/memory/update-learning", async (req) => {
-    const { needle, text } = await readBody<{ needle: string; text: string }>(req);
-    return (needle && text) ? json({ ok: true, data: service.memory.updateLearning(needle, text) }) : errResponse("needle+text required", 400);
-  });
-  r.set("POST /api/memory/update-preference", async (req) => {
-    const { needle, text, category } = await readBody<{ needle: string; text: string; category?: string }>(req);
-    return (needle && text) ? json({ ok: true, data: service.memory.updatePreference(needle, text, category) }) : errResponse("needle+text required", 400);
-  });
-  r.set("POST /api/memory/delete-learning", async (req) => {
-    const { needle } = await readBody<{ needle: string }>(req);
-    return needle ? json({ ok: true, data: service.memory.deleteLearning(needle) }) : errResponse("needle required", 400);
-  });
-  r.set("POST /api/memory/delete-preference", async (req) => {
-    const { needle } = await readBody<{ needle: string }>(req);
-    return needle ? json({ ok: true, data: service.memory.deletePreference(needle) }) : errResponse("needle required", 400);
-  });
-  r.set("POST /api/memory/reinforce", async (req) => {
-    const { needle } = await readBody<{ needle: string }>(req);
-    return needle ? json({ ok: true, data: service.memory.reinforce(needle) }) : errResponse("needle required", 400);
-  });
-  r.set("POST /api/memory/search", async (req) => {
-    const { query } = await readBody<{ query: string }>(req);
-    return query ? json({ ok: true, data: await service.memory.search(query) }) : errResponse("query required", 400);
-  });
-  r.set("POST /api/memory/list", async () => json({ ok: true, data: service.memory.list() }));
-  r.set("POST /api/memory/consolidate", async () => json({ ok: true, data: service.memory.consolidate() }));
-  r.set("POST /api/memory/repair", async () => json({ ok: true, data: service.memory.repair(true) }));
-  r.set("POST /api/memory/conflicts", async () => json({ ok: true, data: service.memory.detectConflicts() }));
-  r.set("POST /api/memory/log", async () => json({ ok: true, data: service.memory.getLog() }));
-  r.set("POST /api/memory/export", async (req) => {
-    const { path } = await readBody<{ path?: string }>(req);
-    const role = service.getActiveRole();
-    if (!role) return errResponse("No active role", 400);
-    const html = service.memory.exportHtml(path);
-    return json({ ok: true, data: { bytes: html.length } });
-  });
-  r.set("POST /api/memory/extract", async (req) => {
-    const { messages } = await readBody<{ messages: any[] }>(req);
-    return json({ ok: true, data: await service.memory.autoExtract(messages || []) });
-  });
-  r.set("POST /api/memory/tidy", async (req) => {
-    const { model } = await readBody<{ model?: string }>(req);
-    return json({ ok: true, data: await service.memory.tidyLlm(model) });
-  });
+  r.set("POST /api/memory/scenario/list", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.scenarios.list() }); });
+  r.set("POST /api/memory/scenario/read", async (req) => { const b = await readBody<any>(req); const s = await get(b); if (!b.id) return badRequest("id required"); const result = s.memory.scenarios.read(b.id); return result ? json({ ok: true, data: result }) : notFound("Scenario not found"); });
+  r.set("POST /api/memory/scenario/search", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.query ? json({ ok: true, data: s.memory.scenarios.search(b.query, { maxResults: b.maxResults, minScore: b.minScore }) }) : badRequest("query required"); });
+  r.set("POST /api/memory/list", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.list() }); });
+  r.set("POST /api/memory/consolidate", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.consolidate() }); });
+  r.set("POST /api/memory/repair", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.repair(true) }); });
+  r.set("POST /api/memory/conflicts", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.detectConflicts() }); });
+  r.set("POST /api/memory/log", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.memory.getLog() }); });
+  r.set("POST /api/memory/export", async (req) => { const b = await readBody<any>(req); const s = await get(b); const role = s.getActiveRole(); if (!role) return badRequest("No active role"); const html = s.memory.exportHtml(b.path); return json({ ok: true, data: { bytes: html.length } }); });
+  r.set("POST /api/memory/extract", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.memory.autoExtract(b.messages || []) }); });
+  r.set("POST /api/memory/tidy", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.memory.tidyLlm(b.model) }); });
 
   // ── Knowledge ──
-  r.set("POST /api/knowledge/list", async (req) => {
-    const { category } = await readBody<{ category?: string }>(req);
-    return json({ ok: true, data: service.knowledge.list(category) });
-  });
-  r.set("POST /api/knowledge/search", async (req) => {
-    const { query, tags } = await readBody<{ query: string; tags?: string[] }>(req);
-    return query ? json({ ok: true, data: service.knowledge.search(query, { tags }) }) : errResponse("query required", 400);
-  });
-  r.set("POST /api/knowledge/read", async (req) => {
-    const { path } = await readBody<{ path: string }>(req);
-    if (!path) return errResponse("path required", 400);
-    const result = service.knowledge.read(path);
-    return result ? json({ ok: true, data: result }) : errResponse("Not found", 404);
-  });
-  r.set("POST /api/knowledge/write", async (req) => {
-    const entry = await readBody<any>(req);
-    return entry?.title ? json({ ok: true, data: service.knowledge.write(entry) }) : errResponse("title required", 400);
-  });
+  r.set("POST /api/knowledge/list", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: s.knowledge.list(b.category) }); });
+  r.set("POST /api/knowledge/search", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.query ? json({ ok: true, data: s.knowledge.search(b.query, { tags: b.tags }) }) : badRequest("query required"); });
+  r.set("POST /api/knowledge/read", async (req) => { const b = await readBody<any>(req); const s = await get(b); if (!b.path) return badRequest("path required"); const result = s.knowledge.read(b.path); return result ? json({ ok: true, data: result }) : notFound("Not found"); });
+  r.set("POST /api/knowledge/write", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.title ? json({ ok: true, data: s.knowledge.write(b) }) : badRequest("title required"); });
 
   // ── Embedding ──
-  r.set("POST /api/embedding/stats", async () => json({ ok: true, data: await service.embedding.stats() }));
-  r.set("POST /api/embedding/rebuild", async () => json({ ok: true, data: await service.embedding.rebuild() }));
+  r.set("POST /api/embedding/stats", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.embedding.stats() }); });
+  r.set("POST /api/embedding/rebuild", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.embedding.rebuild() }); });
 
-  // ── System Prompt ──
-  r.set("POST /api/prompt", async (req) => {
-    const { base } = await readBody<{ base?: string }>(req);
-    return json({ ok: true, data: { prompt: await service.buildSystemPrompt(base || "You are an AI assistant.") } });
+  // ── File Operations ──
+  r.set("POST /api/file/read", async (req) => {
+    const b = await readBody<any>(req);
+    if (!b.path) return badRequest("path required");
+    try {
+      const s = await get(b);
+      const role = s.getActiveRole();
+      if (!role) return badRequest("No active role");
+      const fullPath = join(role.path, b.path);
+      if (!fullPath.startsWith(role.path)) return forbidden("Path escape blocked");
+      if (!existsSync(fullPath)) return notFound("File not found");
+      const content = readFileSync(fullPath, "utf-8");
+      return json({ ok: true, data: { path: b.path, content, size: content.length } });
+    } catch (e) { return errResponse(e); }
   });
+  r.set("POST /api/file/write", async (req) => {
+    const b = await readBody<any>(req);
+    if (!b.path || b.content === undefined) return badRequest("path+content required");
+    try {
+      const s = await get(b);
+      const role = s.getActiveRole();
+      if (!role) return badRequest("No active role");
+      const fullPath = join(role.path, b.path);
+      if (!fullPath.startsWith(role.path)) return forbidden("Path escape blocked");
+      writeFileSync(fullPath, b.content, "utf-8");
+      return json({ ok: true, data: { path: b.path, size: b.content.length } });
+    } catch (e) { return errResponse(e); }
+  });
+  r.set("POST /api/file/list", async (req) => {
+    const b = await readBody<any>(req);
+    try {
+      const s = await get(b);
+      const role = s.getActiveRole();
+      if (!role) return badRequest("No active role");
+      const fullDir = join(role.path, b.dir || "");
+      if (!fullDir.startsWith(role.path)) return forbidden("Path escape blocked");
+      if (!existsSync(fullDir)) return notFound("Directory not found");
+
+      const scanDir = (dir: string, rel: string): any[] => {
+        return readdirSync(dir, { withFileTypes: true })
+          .filter(e => !e.name.startsWith(".") && e.name !== "node_modules")
+          .flatMap(e => {
+            const p = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) {
+              if (b.recursive) {
+                return [{ name: e.name, isDir: true, path: p, children: scanDir(join(dir, e.name), p) }];
+              }
+              return [{ name: e.name, isDir: true, path: p }];
+            }
+            return [{ name: e.name, isDir: false, path: p }];
+          })
+          .sort((a, b2) => {
+            if (a.isDir !== b2.isDir) return a.isDir ? -1 : 1;
+            return b2.name.localeCompare(a.name);
+          });
+      };
+
+      return json({ ok: true, data: scanDir(fullDir, b.dir || "") });
+    } catch (e) { return errResponse(e); }
+  });
+
+  // ── Models ──
+  r.set("GET /api/models", async () => {
+    try {
+      const modelsPath = join(homedir(), ".pi", "agent", "models.json");
+      if (!existsSync(modelsPath)) return json({ ok: true, data: { providers: {} } });
+      const raw = readFileSync(modelsPath, "utf-8");
+      const data = JSON.parse(raw);
+      // Flatten to list of {provider, model, name, contextWindow}
+      const models: any[] = [];
+      for (const [provName, prov] of Object.entries(data.providers || {})) {
+        for (const m of (prov as any).models || []) {
+          models.push({ provider: provName, model: m.id, name: m.name, contextWindow: m.contextWindow, maxTokens: m.maxTokens });
+        }
+      }
+      return json({ ok: true, data: { models, raw: data } });
+    } catch (e) { return errResponse(e); }
+  });
+
+  // ── Config ──
+  r.set("POST /api/config/read", async () => {
+    try {
+      const configPath = join(homedir(), ".pi", "roles", "pi-role-persona.jsonc");
+      if (!existsSync(configPath)) return json({ ok: true, data: { path: configPath, content: "{}" } });
+      return json({ ok: true, data: { path: configPath, content: readFileSync(configPath, "utf-8") } });
+    } catch (e) { return errResponse(e); }
+  });
+  r.set("POST /api/config/write", async (req) => {
+    const b = await readBody<any>(req);
+    if (!b.content) return badRequest("content required");
+    try {
+      const configPath = join(homedir(), ".pi", "roles", "pi-role-persona.jsonc");
+      writeFileSync(configPath, b.content, "utf-8");
+      return json({ ok: true, data: { path: configPath, size: b.content.length } });
+    } catch (e) { return errResponse(e); }
+  });
+
+  // ── Activity Analytics (from JSONL logs) ──
+  r.set("POST /api/activity/stats", async (req) => {
+    try {
+      const b = await readBody<any>(req);
+      const days = Math.min(b.days || 7, 30);
+      const rolesDir = join(homedir(), ".pi", "roles");
+      const logDir = join(rolesDir, ".log");
+      if (!existsSync(logDir)) return json({ ok: true, data: { tags: {}, hourly: {}, roles: {}, extract: { runs: 0, learnings: 0, preferences: 0, errors: 0 }, checkpoints: 0, recentEvents: [] } });
+
+      const files = readdirSync(logDir)
+        .filter((name: string) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+        .sort()
+        .slice(-days);
+
+      const tags: Record<string, number> = {};
+      const hourly: Record<string, number> = {};
+      const roles: Record<string, number> = {};
+      const extract = { runs: 0, learnings: 0, preferences: 0, errors: 0, filtered: 0 };
+      let checkpoints = 0;
+      const recentEvents: Array<{ time: string; tag: string; message: string; role: string; ts: number }> = [];
+      const recentN = Math.min(b.recentLimit || 20, 100);
+
+      for (const file of files) {
+        const filePath = join(logDir, file);
+        try {
+          const content = readFileSync(filePath, "utf-8");
+          const lines = content.split("\n").filter(Boolean);
+          for (const line of lines) {
+            try {
+              const j = JSON.parse(line);
+              const tag = j.tag || "";
+              const msg = j.message || "";
+              const ctx = j.context || {};
+              const ts = j.epoch_ms || (j.timestamp ? new Date(j.timestamp).getTime() : 0);
+              const hour = j.timestamp ? j.timestamp.substring(11, 13) : "??";
+              const role = ctx.role || "-";
+
+              tags[tag] = (tags[tag] || 0) + 1;
+              if (hour !== "??") hourly[hour] = (hourly[hour] || 0) + 1;
+              if (role !== "-") roles[role] = (roles[role] || 0) + 1;
+
+              if (tag === "auto-extract") {
+                if (msg.includes("start")) extract.runs++;
+                const lMatch = msg.match(/(\d+) learnings/);
+                const pMatch = msg.match(/(\d+) preferences/);
+                if (lMatch) extract.learnings += parseInt(lMatch[1], 10);
+                if (pMatch) extract.preferences += parseInt(pMatch[1], 10);
+                if (/(error|fail|abort)/i.test(msg)) extract.errors++;
+                if (msg.includes("filtered")) extract.filtered++;
+              }
+              if (tag === "checkpoint") checkpoints++;
+
+              // Collect recent events for the last entries
+              if (ts > 0) {
+                const d = new Date(ts);
+                const time = [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":");
+                recentEvents.push({ time, tag, message: msg.slice(0, 120), role, ts });
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+
+      // Sort and keep recent
+      recentEvents.sort((a, b2) => b2.ts - a.ts);
+      const trimmedRecent = recentEvents.slice(0, recentN);
+
+      return json({
+        ok: true,
+        data: { tags, hourly, roles, extract, checkpoints, recentEvents: trimmedRecent, days, files: files.length },
+      });
+    } catch (e) { return errResponse(e); }
+  });
+
+  // ── Prompt ──
+  r.set("POST /api/prompt", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: { prompt: await s.buildSystemPrompt(b.base || "You are an AI assistant.") } }); });
 
   // ── Shutdown ──
-  r.set("POST /api/shutdown", async () => {
-    setTimeout(() => { removePid(); process.exit(0); }, 100);
-    return json({ ok: true, data: { shutting_down: true } });
-  });
+  r.set("POST /api/shutdown", async () => { setTimeout(() => { removePid(); process.exit(0); }, 100); return json({ ok: true, data: { shutting_down: true } }); });
 
   return r;
 }
@@ -223,7 +576,6 @@ export interface DaemonOptions {
 }
 
 export function startDaemon(opts: DaemonOptions = {}) {
-  // Single instance check
   const existingPid = readPid();
   if (existingPid) {
     console.error(`[daemon] already running (pid ${existingPid}). Kill it first: kill ${existingPid}`);
@@ -231,104 +583,82 @@ export function startDaemon(opts: DaemonOptions = {}) {
   }
 
   const port = opts.port ?? DEFAULT_PORT;
-  const service = createService();
-  const routes = buildRoutes(service);
-
-  // Init service
-  service.init(process.cwd()).catch((e) => console.error("[daemon] init failed:", e));
+  const mgr = new ServiceManager({
+    llm: createDaemonLlmCaller(),
+    modelRegistry: createDaemonModelRegistry(),
+    currentModel: null,
+    apiKeyResolver: createDaemonApiKeyResolver(),
+  });
+  const routes = buildRoutes(mgr);
 
   const server = Bun.serve({
     port,
     async fetch(req) {
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
-      const routeKey = `${req.method} ${new URL(req.url).pathname}`;
-      const handler = routes.get(routeKey);
-      if (!handler) return json({ ok: false, error: `Not found: ${routeKey}` }, 404);
-      try { return await handler(req); } catch (e) { return errResponse(e); }
+
+      const path = new URL(req.url).pathname;
+      if (path.startsWith("/api/")) {
+        const routeKey = `${req.method} ${path}`;
+        const handler = routes.get(routeKey);
+        if (!handler) return notFound(`Not found: ${routeKey}`);
+        try { return await handler(req); } catch (e) { return errResponse(e); }
+      }
+
+      if (req.method !== "GET" && req.method !== "HEAD") return notFound(`Not found: ${req.method} ${path}`);
+      return serveStatic(req);
     },
   });
 
-  // Write PID + port
   writePid(process.pid);
   writePort(server.port);
 
-  // Graceful shutdown
   const shutdown = () => {
     console.log("[daemon] shutting down...");
     removePid();
-    service.dispose().then(() => process.exit(0));
+    mgr.dispose().then(() => process.exit(0));
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 
   console.log(`[role-persona daemon] pid=${process.pid} http://localhost:${server.port}`);
+  console.log(`[role-persona daemon] web=http://localhost:${server.port}`);
+  console.log(`[role-persona daemon] static=${DEFAULT_STATIC_DIR}`);
   console.log(`[role-persona daemon] pidfile=${PID_FILE}`);
   console.log(`[role-persona daemon] stop: kill ${process.pid} or POST /api/shutdown`);
 
-  return { server, service };
+  return { server, mgr };
 }
 
 // ── Background spawn ──
 
-export function startDaemonBackground(port = DEFAULT_PORT): { ok: boolean; pid?: number; error?: string } {
+export async function startDaemonBackground(port = DEFAULT_PORT): Promise<{ ok: boolean; pid?: number; error?: string }> {
   if (isDaemonRunning()) {
     const pid = readPid()!;
     return { ok: true, pid, error: `already running (pid ${pid})` };
   }
 
-  const proc = spawn(
-    "bun",
-    [join(import.meta.dir || ".", "../transport/daemon.ts"), "--port", String(port)],
-    { detached: true, stdio: ["ignore", "pipe", "pipe"] }
-  );
+  const proc = spawn("bun", [join(import.meta.dir || ".", "../transport/daemon.ts"), "--port", String(port)], {
+    detached: true, stdio: ["ignore", "pipe", "pipe"],
+  });
+  proc.unref();
 
-  // Wait a bit for startup
   return new Promise((resolve) => {
     let resolved = false;
     proc.stdout?.on("data", (chunk: Buffer) => {
-      const line = chunk.toString();
-      if (line.includes("pid=") && !resolved) {
-        resolved = true;
-        const pid = readPid();
-        resolve({ ok: true, pid: pid || proc.pid });
-      }
+      if (chunk.toString().includes("pid=") && !resolved) { resolved = true; resolve({ ok: true, pid: readPid() || proc.pid }); }
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
-      const line = chunk.toString();
-      if (line.includes("already running") && !resolved) {
-        resolved = true;
-        resolve({ ok: false, error: line.trim() });
-      }
+      if (chunk.toString().includes("already running") && !resolved) { resolved = true; resolve({ ok: false, error: "already running" }); }
     });
-    proc.unref();
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        const pid = readPid();
-        resolve(pid ? { ok: true, pid } : { ok: false, error: "timeout" });
-      }
-    }, 3000);
+    setTimeout(() => { if (!resolved) { resolved = true; resolve({ ok: false, error: "timeout" }); } }, 5000);
   });
 }
 
-// ── CLI entry ──
-
+// ── Direct run ──
 if (import.meta.main) {
-  const args = process.argv.slice(2);
-  const portIdx = args.indexOf("--port");
-  const port = portIdx !== -1 ? parseInt(args[portIdx + 1]) : DEFAULT_PORT;
-  const background = args.includes("--background");
-
-  if (background) {
-    startDaemonBackground(port).then((r) => {
-      if (r.ok) {
-        console.log(`[daemon] started in background (pid ${r.pid})`);
-      } else {
-        console.error(`[daemon] ${r.error}`);
-      }
-      process.exit(r.ok ? 0 : 1);
-    });
-  } else {
-    startDaemon({ port });
-  }
+  const portArg = process.argv.find((a) => a.startsWith("--port"));
+  const port = portArg ? parseInt(process.argv[process.argv.indexOf(portArg) + 1] || "3939") : DEFAULT_PORT;
+  const bg = process.argv.includes("--background");
+  if (bg) { const r = startDaemonBackground(port); console.log(JSON.stringify(r)); }
+  else startDaemon({ port });
 }

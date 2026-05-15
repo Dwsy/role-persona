@@ -103,6 +103,23 @@ describe("CLI", () => {
       expect(r.ok).toBe(true);
       expect(Array.isArray(r.data)).toBe(true);
     });
+
+    test("scenario memory can be written and searched", async () => {
+      const title = `CLI scenario ${Date.now()}`;
+      const write = await run([
+        "memory", "scenario-write",
+        "--title", title,
+        "--guidance", "Use scenario memory from CLI test.",
+        "--triggers", "scenario-cli-test",
+      ]);
+      expect(write.ok).toBe(true);
+      expect(write.data).toHaveProperty("id");
+
+      const search = await run(["memory", "scenario-search", "scenario-cli-test"]);
+      expect(search.ok).toBe(true);
+      expect(Array.isArray(search.data)).toBe(true);
+      expect((search.data as any[]).some((item) => item.title === title)).toBe(true);
+    });
   });
 
   describe("knowledge", () => {

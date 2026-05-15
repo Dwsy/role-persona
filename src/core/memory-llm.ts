@@ -1,7 +1,9 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { convertToLlm, serializeConversation } from "@mariozechner/pi-coding-agent";
-import { complete, completeSimple } from "@mariozechner/pi-ai";
 import { config, type ModelSpec } from "./config.ts";
+import type {
+  ModelInfo,
+  ModelRegistry,
+  LlmCaller,
+} from "./types.ts";
 
 import {
   addRoleLearning,
@@ -110,11 +112,10 @@ function parseModelString(spec: string): { provider: string; modelId: string } |
 }
 
 async function resolveRequestedModel(
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
   requested?: string | ModelSpec
-): Promise<{ model: any; apiKey: string; label: string } | null> {
-  // Defensive: check modelRegistry API
-  const registry = ctx.modelRegistry as any;
+): Promise<{ model: ModelInfo; apiKey: string; label: string } | null> {
   if (!registry || typeof registry.getApiKeyAndHeaders !== "function") {
     logWarn("model-resolve", "modelRegistry.getApiKeyAndHeaders not available");
     return null;
@@ -122,17 +123,17 @@ async function resolveRequestedModel(
 
   // 未指定时使用当前会话模型
   if (!requested) {
-    if (!ctx.model) return null;
-    const auth = await registry.getApiKeyAndHeaders(ctx.model);
+    if (!currentModel) return null;
+    const auth = await registry.getApiKeyAndHeaders(currentModel);
     if (!auth.ok || !auth.apiKey) return null;
-    return { model: ctx.model, apiKey: auth.apiKey, label: `${ctx.model.provider}/${ctx.model.id}` };
+    return { model: currentModel, apiKey: auth.apiKey, label: `${currentModel.provider}/${currentModel.id}` };
   }
 
   // 对象格式 { provider, model }
   if (typeof requested === "object") {
     const { provider, model: modelId } = requested;
-    const all = (ctx.modelRegistry as any)?.getAll ? (ctx.modelRegistry as any).getAll() : [];
-    const picked = all.find((m: any) => 
+    const all = registry.getAll();
+    const picked = all.find((m) => 
       m.provider?.toLowerCase() === provider.toLowerCase() &&
       m.id?.toLowerCase() === modelId.toLowerCase()
     );
@@ -140,7 +141,7 @@ async function resolveRequestedModel(
       log("model-resolve", `model not found: provider=${provider}, model=${modelId}`);
       return null;
     }
-    const auth = await (ctx.modelRegistry as any).getApiKeyAndHeaders(picked);
+    const auth = await registry.getApiKeyAndHeaders(picked);
     if (!auth.ok || !auth.apiKey) {
       log("model-resolve", `no API key for: ${provider}/${modelId}`);
       return null;
@@ -153,10 +154,10 @@ async function resolveRequestedModel(
   if (!parsed) return null;
 
   const { provider, modelId } = parsed;
-  const all = (ctx.modelRegistry as any)?.getAll ? (ctx.modelRegistry as any).getAll() : [];
+  const all = registry.getAll();
   
   // 匹配逻辑：provider/modelId 或纯 modelId
-  const picked = all.find((m: any) => {
+  const picked = all.find((m) => {
     if (provider) {
       // 有 provider，精确匹配 provider + modelId
       return m.provider?.toLowerCase() === provider.toLowerCase() &&
@@ -169,7 +170,7 @@ async function resolveRequestedModel(
   });
 
   if (!picked) return null;
-  const auth = await (ctx.modelRegistry as any).getApiKeyAndHeaders(picked);
+  const auth = await registry.getApiKeyAndHeaders(picked);
   if (!auth.ok || !auth.apiKey) return null;
   return { model: picked, apiKey: auth.apiKey, label: `${picked.provider}/${picked.id}` };
 }
@@ -203,10 +204,10 @@ function normalizeModelSpecs(spec: string | string[] | ModelSpec[] | undefined):
  * 按顺序尝试每个模型，跳过不可用的
  */
 async function resolveModelsWithFallback(
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
   modelSpec?: string | string[] | ModelSpec[]
-): Promise<Array<{ model: any; apiKey: string; label: string }>> {
-  const registry = ctx.modelRegistry as any;
+): Promise<Array<{ model: ModelInfo; apiKey: string; label: string }>> {
   if (!registry || typeof registry.getApiKeyAndHeaders !== "function") {
     logWarn("model-resolve", "modelRegistry.getApiKeyAndHeaders not available in resolveModelsWithFallback");
     return [];
@@ -214,17 +215,17 @@ async function resolveModelsWithFallback(
 
   // 如果未指定，使用当前会话模型
   if (!modelSpec) {
-    if (!ctx.model) return [];
-    const auth = await registry.getApiKeyAndHeaders(ctx.model);
+    if (!currentModel) return [];
+    const auth = await registry.getApiKeyAndHeaders(currentModel);
     if (!auth.ok || !auth.apiKey) return [];
-    return [{ model: ctx.model, apiKey: auth.apiKey, label: `${ctx.model.provider}/${ctx.model.id}` }];
+    return [{ model: currentModel, apiKey: auth.apiKey, label: `${currentModel.provider}/${currentModel.id}` }];
   }
 
   const specs = normalizeModelSpecs(modelSpec);
-  const results: Array<{ model: any; apiKey: string; label: string }> = [];
+  const results: Array<{ model: ModelInfo; apiKey: string; label: string }> = [];
 
   for (const spec of specs) {
-    const resolved = await resolveRequestedModel(ctx, spec);
+    const resolved = await resolveRequestedModel(registry, currentModel, spec);
     if (resolved) {
       results.push(resolved);
     } else {
@@ -298,7 +299,9 @@ function parseLlmTidyPlan(text: string): LlmTidyPlan | null {
 export async function runLlmMemoryTidy(
   rolePath: string,
   roleName: string,
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
+  llmCaller?: LlmCaller,
   requestedModel?: string | string[]
 ): Promise<
   | {
@@ -316,7 +319,7 @@ export async function runLlmMemoryTidy(
 
   // 获取可用模型列表（支持 fallback）
   const resolveStart = Date.now();
-  const resolvedModels = await resolveModelsWithFallback(ctx, requestedModel);
+  const resolvedModels = await resolveModelsWithFallback(registry, currentModel, requestedModel);
   log("llm-tidy", `resolve models took ${Date.now() - resolveStart}ms`, { resolved: resolvedModels.length });
   if (resolvedModels.length === 0) {
     const err = requestedModel
@@ -340,7 +343,8 @@ export async function runLlmMemoryTidy(
 
     let result;
     try {
-      result = await complete(
+      if (!llmCaller) throw new Error("No LLM caller available — plugin must provide LlmCaller");
+      result = await llmCaller.complete(
         resolved.model,
         {
           messages: [
@@ -448,15 +452,17 @@ function estimateTokensRough(text: string): number {
  * - Stops when budget is exceeded
  * - Serializes kept messages via `serializeConversation()`
  */
-function prepareConversationWithBudget(
+async function prepareConversationWithBudget(
   messages: unknown[],
   reserveTokens: number,
   modelContextWindow?: number,
-): string {
+  llmCaller?: LlmCaller,
+): Promise<string> {
   const contextWindow = modelContextWindow || 128000;
   const tokenBudget = contextWindow - reserveTokens;
 
-  const llmMessages = convertToLlm(messages as any);
+  if (!llmCaller) throw new Error("No LLM caller available — plugin must provide LlmCaller");
+  const llmMessages = llmCaller.convertToLlm(messages as any);
 
   // Estimate tokens per message (content length / 4)
   const estimates = llmMessages.map((msg) => {
@@ -477,7 +483,7 @@ function prepareConversationWithBudget(
   }
 
   const kept = llmMessages.slice(startIndex);
-  return serializeConversation(kept);
+  return llmCaller.serializeConversation(kept);
 }
 
 function buildAutoMemoryPrompt(conversationText: string, existing: { learnings: string[]; preferences: string[] }): string {
@@ -506,9 +512,11 @@ If nothing new, return {"learnings":[],"preferences":[]}.`;
 export async function runAutoMemoryExtraction(
   roleName: string,
   rolePath: string,
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
   messages: unknown[],
-  options?: { enabled?: boolean; model?: string | string[]; maxItems?: number; maxText?: number; reserveTokens?: number }
+  llmCaller?: LlmCaller,
+  options?: { enabled?: boolean; model?: string | string[] | ModelSpec[]; maxItems?: number; maxText?: number; reserveTokens?: number }
 ): Promise<{ storedLearnings: number; storedPrefs: number } | null> {
   if (options?.enabled === false) return null;
 
@@ -523,7 +531,7 @@ export async function runAutoMemoryExtraction(
 
   // 获取可用模型列表（支持 fallback）
   const resolveStart = Date.now();
-  const resolvedModels = await resolveModelsWithFallback(ctx, modelSpec);
+  const resolvedModels = await resolveModelsWithFallback(registry, currentModel, modelSpec);
   log("auto-extract", `resolve models took ${Date.now() - resolveStart}ms`, {
     resolved: resolvedModels.length,
     labels: resolvedModels.map(m => m.label).join("|"),
@@ -535,9 +543,9 @@ export async function runAutoMemoryExtraction(
   }
 
   // 使用第一个可用模型准备 prompt（contextWindow 可能不同，取最大）
-  const maxContextWindow = Math.max(...resolvedModels.map(m => m.model.contextWindow || 128000));
+  const maxContextWindow = Math.max(...resolvedModels.map(m => (m.model as any).contextWindow || 128000));
   const reserveTokens = options?.reserveTokens ?? config.autoMemory.reserveTokens;
-  const conversationText = prepareConversationWithBudget(messages, reserveTokens, maxContextWindow);
+  const conversationText = await prepareConversationWithBudget(messages, reserveTokens, maxContextWindow, llmCaller);
 
   if (!conversationText.trim()) {
     log("auto-extract", "abort: empty conversation after budget preparation");
@@ -569,19 +577,21 @@ export async function runAutoMemoryExtraction(
 
     let result;
     try {
-      result = await completeSimple(
+      if (!llmCaller) throw new Error("No LLM caller available — plugin must provide LlmCaller");
+      // Use complete() with system prompt prepended to user message (completeSimple not available via LlmCaller)
+      const fullPrompt = MEMORY_EXTRACTION_SYSTEM_PROMPT + "\n\n" + prompt;
+      result = await llmCaller.complete(
         resolved.model,
         {
-          systemPrompt: MEMORY_EXTRACTION_SYSTEM_PROMPT,
           messages: [
             {
               role: "user" as const,
-              content: [{ type: "text" as const, text: prompt }],
+              content: [{ type: "text" as const, text: fullPrompt }],
               timestamp: Date.now(),
             },
           ],
         },
-        { apiKey: resolved.apiKey, maxTokens: Math.min(512, resolved.model.maxTokens || 512) },
+        { apiKey: resolved.apiKey, maxTokens: Math.min(512, (resolved.model as any).maxTokens || 512) },
       );
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);

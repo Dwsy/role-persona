@@ -36,14 +36,20 @@ function createMcpServer(): McpServer {
         "add_learning", "add_preference", "update_learning", "update_preference",
         "delete_learning", "delete_preference", "reinforce", "search", "list",
         "consolidate", "repair", "llm_tidy", "vector_rebuild", "vector_stats",
+        "scenario_write", "scenario_list", "scenario_read", "scenario_search",
       ] as const).describe("Memory action"),
       content: z.string().optional().describe("Memory text"),
       category: z.string().optional().describe("Preference category"),
       query: z.string().optional().describe("Search query or needle"),
       id: z.string().optional().describe("Memory entry ID"),
       model: z.string().optional().describe("LLM model override"),
+      title: z.string().optional().describe("Scenario title"),
+      guidance: z.string().optional().describe("Scenario guidance"),
+      triggers: z.array(z.string()).optional().describe("Scenario trigger cues"),
+      evidence: z.array(z.string()).optional().describe("Scenario evidence references"),
+      scope: z.string().optional().describe("Scenario scope"),
     },
-  }, async ({ action, content, category, query, id, model }) => {
+  }, async ({ action, content, category, query, id, model, title, guidance, triggers, evidence, scope }) => {
     const args: string[] = [];
     switch (action) {
       case "add_learning":      args.push("memory", "add-learning", content!); break;
@@ -60,6 +66,10 @@ function createMcpServer(): McpServer {
       case "llm_tidy":          args.push("memory", "tidy"); if (model) args.push("--model", model); break;
       case "vector_rebuild":    args.push("embedding", "rebuild"); break;
       case "vector_stats":      args.push("embedding", "stats"); break;
+      case "scenario_write":    args.push("memory", "scenario-write"); if (title) args.push("--title", title); if (guidance) args.push("--guidance", guidance); if (triggers) args.push("--triggers", triggers.join(",")); if (evidence) args.push("--evidence", evidence.join(",")); if (scope) args.push("--scope", scope); break;
+      case "scenario_list":     args.push("memory", "scenario-list"); break;
+      case "scenario_read":     args.push("memory", "scenario-read", id || ""); break;
+      case "scenario_search":   args.push("memory", "scenario-search", query || content || ""); break;
     }
     const result = await cli(args, { timeoutMs: action === "llm_tidy" ? 120000 : 30000 });
     const text = result.ok ? (result.message || JSON.stringify(result.data, null, 2)) : `Error: ${result.error}`;

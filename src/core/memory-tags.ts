@@ -11,12 +11,9 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-// PI_DEPENDENCY: ExtensionContext from pi-coding-agent
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-// PI_DEPENDENCY: completeSimple from pi-ai
-import { completeSimple } from "@mariozechner/pi-ai";
 import { log } from "./logger.ts";
 import { config, type ModelSpec } from "./config.ts";
+import type { ModelInfo, ModelRegistry, LlmCaller } from "./types.ts";
 
 // ============ 配置 ============
 
@@ -123,10 +120,10 @@ Return JSON only:
 }`;
 
 async function resolveTagModel(
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
   requested?: string | string[] | ModelSpec[]
 ): Promise<{ provider: string; modelId: string; apiKey: string; label: string } | null> {
-  const registry = ctx.modelRegistry as any;
   if (!registry || typeof registry.getApiKeyAndHeaders !== "function") {
     log("memory-tags", "modelRegistry.getApiKeyAndHeaders not available");
     return null;
@@ -136,19 +133,19 @@ async function resolveTagModel(
   
   // 如果未指定模型，使用当前会话模型
   if (specs.length === 0) {
-    if (!ctx.model) return null;
-    const auth = await registry.getApiKeyAndHeaders(ctx.model);
+    if (!currentModel) return null;
+    const auth = await registry.getApiKeyAndHeaders(currentModel);
     if (!auth.ok || !auth.apiKey) return null;
     return {
-      provider: ctx.model.provider,
-      modelId: ctx.model.id,
+      provider: currentModel.provider,
+      modelId: currentModel.id,
       apiKey: auth.apiKey,
-      label: `${ctx.model.provider}/${ctx.model.id}`,
+      label: `${currentModel.provider}/${currentModel.id}`,
     };
   }
   
   // 按顺序尝试每个模型
-  const all = registry?.getAll ? registry.getAll() : [];
+  const all = registry.getAll();
   for (const spec of specs) {
     const { provider, model } = spec;
     const picked = all.find((m: any) => {
@@ -180,14 +177,14 @@ async function resolveTagModel(
   }
   
   // 所有模型都不可用，尝试当前会话模型
-  if (ctx.model) {
-    const auth = await registry.getApiKeyAndHeaders(ctx.model);
+  if (currentModel) {
+    const auth = await registry.getApiKeyAndHeaders(currentModel);
     if (auth.ok && auth.apiKey) {
       return {
-        provider: ctx.model.provider,
-        modelId: ctx.model.id,
+        provider: currentModel.provider,
+        modelId: currentModel.id,
         apiKey: auth.apiKey,
-        label: `${ctx.model.provider}/${ctx.model.id}`,
+        label: `${currentModel.provider}/${currentModel.id}`,
       };
     }
   }
@@ -200,10 +197,12 @@ async function resolveTagModel(
  */
 export async function extractTagsWithLLM(
   content: string,
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
+  llmCaller?: LlmCaller,
   modelOverride?: string | string[] | ModelSpec[]
 ): Promise<TagExtractionResult> {
-  const modelInfo = await resolveTagModel(ctx, modelOverride);
+  const modelInfo = await resolveTagModel(registry, currentModel, modelOverride);
   
   if (!modelInfo) {
     log("memory-tags", "No tag model available, using fallback");
@@ -213,18 +212,27 @@ export async function extractTagsWithLLM(
   const prompt = `${TAG_EXTRACTION_PROMPT}\n\nMemory content:\n"""\n${content.slice(0, 500)}\n"""\n\nExtract tags as JSON:`;
   
   try {
-    const response = await completeSimple(
+    if (!llmCaller) throw new Error("No LLM caller available");
+    const response = await llmCaller.complete(
       {
         provider: modelInfo.provider,
-        modelId: modelInfo.modelId,
-        apiKey: modelInfo.apiKey,
-        dangerouslyAllowBrowser: true,
+        id: modelInfo.modelId,
+        name: modelInfo.label,
       },
-      [{ role: "user", content: prompt }],
-      { temperature: 0.3, maxTokens: 300 }
+      {
+        messages: [
+          {
+            role: "user" as const,
+            content: [{ type: "text" as const, text: prompt }],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      { apiKey: modelInfo.apiKey, maxTokens: 300 }
     );
+    const responseText = extractResponseTextFromResult(response);
     
-    const result = parseTagResponse(response);
+    const result = parseTagResponse(responseText);
     log("memory-tags", `LLM extracted ${result.tags.length} tags using ${modelInfo.label}`);
     
     return result;
@@ -232,6 +240,14 @@ export async function extractTagsWithLLM(
     log("memory-tags", `LLM tag extraction failed: ${err}`);
     return extractTagsFallback(content);
   }
+}
+
+function extractResponseTextFromResult(result: { content: Array<{ type: string; text?: string; thinking?: string }> }): string {
+  const parts: string[] = [];
+  for (const block of result.content) {
+    if (block.type === "text" && block.text) parts.push(block.text);
+  }
+  return parts.join("\n").trim();
 }
 
 function parseTagResponse(text: string): TagExtractionResult {
@@ -410,14 +426,16 @@ export async function updateMemoryTagsAsync(
   rolePath: string,
   memoryId: string,
   content: string,
-  ctx: ExtensionContext,
+  registry: ModelRegistry,
+  currentModel: ModelInfo | null,
+  llmCaller?: LlmCaller,
   existingTags?: string[]
 ): Promise<{ tags: string[]; newTags: string[]; suggestedCategory?: string }> {
   const index = loadTagsIndex(rolePath);
   const today = new Date().toISOString().split("T")[0];
   
   // 使用 LLM 提取标签
-  const extraction = await extractTagsWithLLM(content, ctx);
+  const extraction = await extractTagsWithLLM(content, registry, currentModel, llmCaller);
   const llmTags = extraction.tags.map(t => t.tag);
   
   // 合并现有标签
@@ -731,7 +749,7 @@ export function getAllTags(data: any): TagRegistry {
   for (const tag of Object.keys(registry)) {
     const entry = registry[tag];
     const daysSinceUse = (now - entry.lastUsed) / DAY;
-    const retention = calculateRetention(daysSinceUse);
+    const retention = calculateRetention(1, daysSinceUse);
     entry.weight *= retention;
     entry.forgotten = retention < 0.3;
   }

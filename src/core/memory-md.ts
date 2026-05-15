@@ -2,7 +2,6 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSyn
 import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { log } from "./logger.ts";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { extractTagsWithLLM, getRelatedTags, searchTags, updateMemoryTagsAsync, type TagRegistry } from "./memory-tags.ts";
 import { config } from "./config.ts";
 
@@ -37,6 +36,7 @@ export interface RoleMemoryMetadata {
 }
 
 export interface RoleMemoryData {
+  rolePath?: string;
   roleName: string;
   metadata: RoleMemoryMetadata;
   autoExtracted: boolean;
@@ -294,6 +294,9 @@ export function ensureRoleMemoryFiles(rolePath: string, roleName: string): void 
 
   const dailyDir = dailyMemoryDir(rolePath);
   if (!existsSync(dailyDir)) mkdirSync(dailyDir, { recursive: true });
+
+  const scenariosDir = join(memoryRootDir(rolePath), "scenarios");
+  if (!existsSync(scenariosDir)) mkdirSync(scenariosDir, { recursive: true });
 
   migrateLegacyMemoryLayout(rolePath);
 
@@ -1011,12 +1014,11 @@ export function addRoleLearning(
 }
 
 export async function addRoleLearningWithTags(
-  ctx: ExtensionContext,
   rolePath: string,
   roleName: string,
   text: string,
-  options?: { source?: string; appendDaily?: boolean; tagModel?: string }
-): Promise<{ stored: boolean; duplicate?: boolean; id?: string; reason?: string; tags?: string[] }> {
+  options?: { source?: string; appendDaily?: boolean; tagModel?: string; registry?: any; currentModel?: any; llmCaller?: any }
+): Promise<{ stored: boolean; duplicate?: boolean; id?: string; reason?: string; tags?: string[]; layer?: "pending" | "consolidated" }> {
   const normalized = normalizeText(text);
   if (!normalized || normalized === "(none)") return { stored: false, reason: "empty" };
 
@@ -1029,7 +1031,7 @@ export async function addRoleLearningWithTags(
     }
     let tags: string[] = [];
     try {
-      const extraction = await extractTagsWithLLM(normalized, ctx, options?.tagModel);
+      const extraction = await extractTagsWithLLM(normalized, options?.registry!, options?.currentModel ?? null, options?.llmCaller, options?.tagModel);
       tags = extraction.tags.map((t) => t.tag);
     } catch { /* tag extraction is non-critical */ }
     if (options?.appendDaily !== false) {
@@ -1042,7 +1044,7 @@ export async function addRoleLearningWithTags(
   const duplicate = data.learnings.find((l) => normalizeText(l.text).toLowerCase() === normalized.toLowerCase());
   if (duplicate) return { stored: false, duplicate: true, id: duplicate.id, reason: "duplicate" };
 
-  const extraction = await extractTagsWithLLM(normalized, ctx, options?.tagModel);
+  const extraction = await extractTagsWithLLM(normalized, options?.registry!, options?.currentModel ?? null, options?.llmCaller, options?.tagModel);
   const tags = extraction.tags.map((t) => t.tag);
 
   data.learnings.push({
@@ -1868,7 +1870,7 @@ export function detectMemoryConflicts(rolePath: string): MemoryConflict[] {
         processed.add(b.id);
         conflicts.push({
           type: "duplication",
-          category: 'preference' in a ? a.category : undefined,
+          category: a.kind === 'preference' ? a.category : undefined,
           items: [
             { id: a.id, text: a.text, reason: `与另一条相似度 ${(sim * 100).toFixed(0)}%` },
             { id: b.id, text: b.text, reason: `与另一条相似度 ${(sim * 100).toFixed(0)}%` }

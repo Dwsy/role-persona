@@ -1,6 +1,6 @@
 {
   "name": "role-persona",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Role-based persona system for AI agents — memory, knowledge, embedding. CLI, MCP, daemon, Pi extension.",
   "author": "Dwsy",
@@ -93,8 +93,14 @@
     "@mariozechner/pi-tui": "*"
   },
   "peerDependenciesMeta": {
-    "@mariozechner/pi-coding-agent": { "optional": true },
-    "@mariozechner/pi-ai": { "optional": true },
-    "@mariozechner/pi-tui": { "optional": true }
+    "@mariozechner/pi-coding-agent": {
+      "optional": true
+    },
+    "@mariozechner/pi-ai": {
+      "optional": true
+    },
+    "@mariozechner/pi-tui": {
+      "optional": true
+    }
   }
 }

@@ -30,6 +30,8 @@ import {
   ROLES_DIR,
   saveRoleConfig,
 } from "../core/role-store.ts";
+import { repairRoleMemory, expirePendingMemories, ensureRoleMemoryFiles } from "../core/memory-md.ts";
+import { log } from "../core/logger.ts";
 import type { ServiceContext } from "./context.ts";
 
 export interface RoleService {
@@ -76,6 +78,26 @@ export function createRoleService(ctx: ServiceContext): RoleService {
       if (!existsSync(rolePath)) {
         createRole(name);
       }
+
+      // Ensure memory files exist
+      ensureRoleMemoryFiles(rolePath, name);
+
+      // Auto-repair consolidated.md
+      try {
+        const repairResult = repairRoleMemory(rolePath, name);
+        if (repairResult.repaired) {
+          log("role-activate", `auto-repair: ${repairResult.issues} issues fixed for ${name}`);
+        }
+      } catch { /* repair is best-effort */ }
+
+      // Expire old pending memories (> 7 days without promotion)
+      try {
+        const expireResult = expirePendingMemories(rolePath, 7);
+        if (expireResult.expired > 0) {
+          log("role-activate", `expired ${expireResult.expired} old pending memories for ${name}`);
+        }
+      } catch { /* expire is best-effort */ }
+
       const identity = getRoleIdentity(rolePath);
       const firstRun = isFirstRun(rolePath);
       const active: ActiveRole = { name, path: rolePath, identity, isFirstRun: firstRun };

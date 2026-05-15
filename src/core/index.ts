@@ -35,8 +35,20 @@ export {
   disposeVectorMemory, hybridSearch, autoRecall, rebuildVectorIndex, getVectorStats,
 } from "./memory-vector.ts";
 export {
+  ensureMemoryScenarioLayer, writeMemoryScenario, listMemoryScenarios,
+  readMemoryScenario, searchMemoryScenarios, buildScenarioPromptBlock,
+} from "./memory-scenarios.ts";
+export {
   listKnowledge, readKnowledge, searchKnowledge, writeKnowledge,
 } from "./knowledge.ts";
+export {
+  type EmbeddingProvider,
+  OpenAIEmbeddingProvider,
+  LocalEmbeddingProvider,
+  MiniLMEmbeddingProvider,
+  createEmbeddingProvider,
+} from "./embedding.ts";
+export { VectorDB } from "./vector-db.ts";
 export {
   AllMiniLMEmbeddingProvider,
 } from "./embedding-minilm.ts";

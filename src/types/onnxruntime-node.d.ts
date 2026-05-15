@@ -5,7 +5,7 @@ declare module "onnxruntime-node" {
     dims: number[];
   }
   export class InferenceSession {
-    static create(path: string): Promise<InferenceSession>;
+    static create(path: string, options?: any): Promise<InferenceSession>;
     run(feeds: Record<string, Tensor>): Promise<Record<string, Tensor>>;
   }
   export const env: {

@@ -85,10 +85,10 @@ async function startDaemonInBackground(): Promise<number | null> {
     proc.unref();
 
     // Wait for PID file to appear (= daemon started)
-    const maxWait = 5000;
+    const maxWait = 2000;
     const start = Date.now();
     while (Date.now() - start < maxWait) {
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 50));
       const port = daemonPort();
       if (port) return port;
     }
@@ -154,7 +154,7 @@ function mapArgsToEndpoint(args: string[]): { path: string; body: Record<string,
  * Run a CLI command. Daemon HTTP with auto-start, subprocess fallback.
  */
 export async function cli(args: string[], opts: CliOptions = {}): Promise<CliResult> {
-  const timeout = opts.timeoutMs || 30000;
+  const timeout = opts.timeoutMs || 10000;
 
   // Try daemon HTTP (auto-start if needed)
   let port = daemonPort();
@@ -205,7 +205,7 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
     }
 
     const timer = timeout
-      ? setTimeout(() => { proc.kill("SIGTERM"); reject(new Error("CLI timeout")); }, timeout)
+      ? setTimeout(() => { proc.kill("SIGTERM"); resolve({ ok: false, error: "CLI timeout" }); }, timeout)
       : null;
 
     proc.on("close", (code) => {

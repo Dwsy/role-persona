@@ -1,461 +1,407 @@
-# role-persona
+# Role Persona
 
-Role-based persona system for AI agents — memory, knowledge, and embedding management.
+> Role-based persona system for AI agents — memory, knowledge, embedding.
+> CLI · HTTP Daemon · MCP Server · Pi Extension · Web Dashboard
 
-Runs as a **Pi extension**, **CLI**, **MCP server**, or **HTTP daemon**.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Bun](https://img.shields.io/badge/bun-%3E%3D1.0.0-yellow)](https://bun.sh)
 
-[中文文档](./README.zh-CN.md)
+---
 
-## Quick start
+## Overview
 
-```bash
-# Clone
-git clone https://github.com/Dwsy/role-persona.git
-cd role-persona
-bun install
+Role Persona is a persistent memory and knowledge system for AI coding agents. It provides:
 
-# Initialize (detects mapped role for current directory)
-bun src/bin/cli.ts init
-
-# Use
-bun src/bin/cli.ts memory list
-bun src/bin/cli.ts memory search "query"
-bun src/bin/cli.ts knowledge list
-```
-
-## What it does
-
-| Feature | Description |
-|---------|-------------|
-| **Memory** | Auto-extracted learnings, preferences, events from conversations |
-| **Knowledge** | Multi-source knowledge base with search, tags, and categories |
-| **Embedding** | Vector search with OpenAI, local ONNX, or shared daemon |
-| **Roles** | Per-directory persona with independent memory and prompts |
-| **Auto-extract** | LLM-powered memory extraction during agent compaction |
-| **Tags** | Auto-tagging with forgetting curve (Ebbinghaus) |
-| **Pending layer** | New memories go through verification before becoming permanent |
+- **Role Management** — independent personas with isolated memory/knowledge
+- **Memory System** — learnings, preferences, auto-extraction, consolidation, vector search
+- **Knowledge Base** — multi-source, tag-searchable, version-controlled entries
+- **Vector Memory** — LanceDB-backed semantic search with hybrid keyword+vector fusion
+- **Multiple Interfaces** — CLI, HTTP daemon, MCP server, Pi extension, Web dashboard
 
 ## Architecture
 
 ```
-Transport Layer (1,817L)
-├── Pi Adapter     532L   thin CLI wrapper, zero service dep
-├── CLI            303L   daemon-aware, JSON output
-├── MCP Server     221L   Streamable HTTP, SSE
-├── HTTP Daemon    334L   Bun.serve, pidfile, single-instance
-├── Memory Server  286L   HTML viewer with theme toggle + log dashboard
-├── CLI Runner     185L   daemon HTTP → subprocess fallback
-├── HTTP Client     52L   daemon HTTP client
-└── TUI Renderers  326L   Pi tool result renderers
-        │
-Service Layer (877L) ← zero Pi dependency
-├── context         65L   ServiceContext
-├── index          188L   RolePersonaService facade
-├── role-service   184L   role CRUD + mapping
-├── memory-service 306L   14 memory actions + auto-extract
-├── knowledge-svc   71L   knowledge CRUD + search
-└── embedding-svc   63L   vector lifecycle
-        │
-Core Layer (10,071L) ← zero Pi dependency, pure functions
-├── types           591L   shared type definitions
-├── config          677L   three-tier config (env/jsonc/default)
-├── logger          478L   JSONL structured logging
-├── spinner-utils    14L   spinner frames
-├── role-store      458L   role CRUD, CWD mapping, migration
-├── role-template   376L   i18n prompts (zh/en)
-├── memory-md      2185L   memory CRUD, parsing, search, pending
-├── memory-llm      726L   LLM auto-extraction + tidy
-├── extraction-rules  50L   ephemeral/derivable filtering
-├── memory-tags     773L   LLM tagging, forgetting curve
-├── memory-vector   806L   LanceDB vector, hybrid search
-├── memory-export   687L   HTML export with tree navigation
-├── knowledge       831L   multi-source knowledge CRUD
-├── embedding-daemon 822L   shared ONNX daemon server
-├── embedding-minilm 443L   direct ONNX provider
-└── daemon-client   154L   daemon client provider
+┌─────────────────────────────────────────────────────────────────┐
+│                         Consumers                                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐│
+│  │   CLI    │  │  Daemon  │  │ MCP Srv  │  │   Pi Plugin      ││
+│  │          │  │ (HTTP)   │  │ (RPC)    │  │ (direct service) ││
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └───────┬──────────┘│
+│       │              │              │                │           │
+│  ┌────┴──────────────┴──────────────┴────────────────┴────────┐ │
+│  │              ServiceManager (CWD multiplexing)              │ │
+│  │   CWD → Service instance    Role name → Service instance   │ │
+│  │   30min idle timeout        Auto cleanup                    │ │
+│  └────┬───────────────────────────────────────────────────────┘ │
+│       │                                                         │
+│  ┌────┴──────────────────────────────────────────────────────┐ │
+│  │                   Service Layer                            │ │
+│  │  RoleService · MemoryService · KnowledgeService            │ │
+│  │  EmbeddingService · SystemPromptBuilder                    │ │
+│  └────┬──────────────┬──────────────┬───────────────┬────────┘ │
+│       │              │              │               │           │
+│  ┌────┴──────┐ ┌─────┴─────┐ ┌─────┴──────┐ ┌─────┴────────┐ │
+│  │  Core     │ │ Embedding │ │ Vector DB  │ │   Config     │ │
+│  │ memory-md │ │ providers │ │  (LanceDB) │ │  (JSONC)     │ │
+│  │ memory-llm│ │ OpenAI    │ │            │ │              │ │
+│  │ memory-tag│ │ Local     │ │            │ │              │ │
+│  └───────────┘ │ MiniLM    │ └────────────┘ └──────────────┘ │
+│                └───────────┘                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## Runtime modes
+### Multiplexing
 
-### 1. CLI (default)
+The daemon supports **CWD-based** and **role-based** multiplexing:
+
+```
+CLI mode:    POST /api/memory/list { "cwd": "/project" }  → resolves role from CWD
+Web mode:    POST /api/memory/list { "role": "zero" }     → directly activates role
+Pi mode:     Direct service import (no HTTP)
+```
+
+Each CWD/role gets an independent service instance with 30-minute idle timeout.
+
+## Quick Start
+
+### Installation
 
 ```bash
-# Direct execution (cold start ~250ms)
+git clone https://github.com/Dwsy/role-persona.git
+cd role-persona
+bun install
+bun run build
+```
+
+### CLI Usage
+
+```bash
+# Initialize (auto-creates role from CWD)
+role-persona init
+
+# Role management
+role-persona role list
+role-persona role create my-role
+role-persona role info
+
+# Memory
+role-persona memory list
 role-persona memory search "query"
+role-persona memory add-learning "Always use TypeScript strict mode"
+role-persona memory add-preference "Use pnpm" --category Tools
+role-persona memory consolidate
+role-persona memory repair
+role-persona memory tidy
 
-# Daemon-aware (auto-detects running daemon, warm ~5ms)
-role-persona daemon start --background
-role-persona memory search "query"  # routes through HTTP
+# Knowledge
+role-persona knowledge list
+role-persona knowledge search "design patterns"
+role-persona knowledge write --title "ADR-001" --content "..." --category architecture
 
-# Force direct execution
-role-persona --direct memory search "query"
+# Vector memory
+role-persona embedding stats
+role-persona embedding rebuild
 
-# Human-readable output
-role-persona --human memory list
+# Scenario memory (L2)
+role-persona memory scenario-write --title "Code review output" --guidance "Give the conclusion first, then group findings by Critical/Medium/Low." --triggers "code review,review feedback"
+role-persona memory scenario-search "review this PR"
+role-persona memory scenario-list
+role-persona memory scenario-read <scenario-id>
+
+# System prompt
+role-persona prompt --base "You are a helpful assistant."
 ```
 
-All commands output JSON to stdout:
-```json
-{ "ok": true, "data": {...}, "message": "Human summary" }
-{ "ok": false, "error": "Description" }
-```
-
-### 2. Daemon (persistent background server)
+### HTTP Daemon
 
 ```bash
-role-persona daemon start              # foreground
-role-persona daemon start --background # detach
-role-persona daemon status             # health check
-role-persona daemon stop               # graceful shutdown
+# Start (persists in memory, warm service)
+role-persona daemon start
+
+# Background mode
+role-persona daemon start --background
+
+# Custom port
+role-persona daemon start --port 8080
+
+# Status / Stop
+role-persona daemon status
+role-persona daemon stop
+```
+
+### Web Dashboard
+
+```bash
+# Build
+cd web && bun install && bun run build
+
+# Start
+role-persona --web                    # unified daemon + web on port 3939
+role-persona --web --port 8080        # custom unified port
 ```
 
 Features:
-- PID file at `~/.pi/role-persona-daemon.pid` (single instance)
-- Port file at `~/.pi/role-persona-daemon.port`
-- Graceful shutdown on SIGTERM/SIGINT
-- Warm service: stays in memory, no cold start
-- 20 REST endpoints mirroring the Service facade
+- **Dashboard** — role banner, memory breakdown, knowledge sources, vector stats, recent activity
+- **Memory** — Explorer tree navigation, table view with edit/delete, Markdown rendering, regex search, keyboard shortcuts (`/` search, `j/k` nav, `c` copy)
+- **Knowledge** — list, search, click to view Markdown, write new entries
+- **Roles** — click to view role detail modal, switch roles
+- **Settings** — daemon status, vector stats, JSONC config editor (Form mode with schema-driven inputs + raw JSONC mode)
+- **i18n** — English/Chinese
+- **Dark/Light** — theme toggle
+- **Role selector** — header dropdown, auto-refresh all pages on switch
+- **URL state** — tab/path/search persisted in URL params (bookmarkable)
+- **Model selector** — dropdown populated from `models.json`
 
-### 3. MCP Server (Streamable HTTP)
-
-```bash
-bun src/transport/mcp-server.ts
-# → http://localhost:3939/mcp
-```
-
-Protocol: MCP spec 2025-03-26
-Transport: `WebStandardStreamableHTTPServerTransport`
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/mcp` | POST | JSON-RPC (initialize, tools/call, tools/list) |
-| `/mcp` | GET | SSE stream for server-initiated messages |
-| `/mcp` | DELETE | Session termination |
-| `/health` | GET | Health check |
-
-4 tools: `memory`, `knowledge`, `role_info`, `role_management`
-
-### 4. Pi Extension
+### Pi Extension
 
 ```typescript
 // extensions/role-persona/index.ts
-export { default } from "../../role-persona/src/transport/pi-adapter.ts";
+export { default } from "../../role-persona/src/extensions/pi/adapter.ts";
 ```
 
-The adapter delegates all operations to the CLI via `cli-runner.ts`:
-- If daemon is running → HTTP call (~5ms)
-- If daemon is not running → subprocess spawn (~250ms)
+- Registers tools: `memory`, `knowledge`, `role_info`
+- Registers commands: `/role`, `/memories`, `/memory-log`, `/memory-fix`, `/memory-tidy`, `/memory-tidy-llm`, `/memory-vector`, `/memory-export`, `/memory-conflicts`, `/memory-distill`, `/memory-distill-stop`, `/memory-tags`, `/kb`
+- Handles events: `session_start`, `before_agent_start`, `agent_end`, `session_before_compact`, `session_shutdown`, `turn_end`
+- Uses Pi SDK directly for LLM calls (no CLI subprocess)
+- On-demand memory search on first message (vector + keyword hybrid)
+- Vector auto-recall injection into system prompt
+- External readonly memory hints (configurable)
+- Compaction memory extraction (`<memory>` block parsing)
+- Interactive memory→knowledge distillation mode
+- TUI role selector and memory viewer (when available)
+- HTTP memory server for browser-based browsing
+- Auto-repair and pending expiration on role activation
 
-Zero imports from service/core layers.
-
-**Extension points:**
-
-| Type | Count | Details |
-|------|-------|---------|
-| Events | 7 | session_start, resources_discover, before_agent_start, agent_end, session_before_compact, session_shutdown, turn_end |
-| Tools | 3 | memory (14 actions), knowledge (4 actions), role_info |
-| Commands | 13 | /role, /memories, /memory-log, /memory-fix, /memory-tidy, /memory-tidy-llm, /memory-vector, /memory-tags, /memory-conflicts, /memory-export, /memory-distill, /memory-distill-stop, /kb |
-
-## CLI commands reference
-
-### Role management
+### MCP Server
 
 ```bash
-role-persona role list                           # List all roles
-role-persona role create <name>                  # Create a new role
-role-persona role info                           # Current role info
-role-persona role map <role>                     # Map current directory to role
-role-persona role unmap                          # Unmap and disable role
+# Start on default port (3939)
+bun src/transport/mcp-server.ts
+
+# Custom port
+MCP_PORT=8080 bun src/transport/mcp-server.ts
 ```
 
-### Memory management
-
-```bash
-# CRUD
-role-persona memory add-learning "content"       # Add a learning
-role-persona memory add-preference "content" --category Code  # Add preference
-role-persona memory update-learning <id> "new text"
-role-persona memory update-preference <id> "new text"
-role-persona memory delete-learning <id>
-role-persona memory delete-preference <id>
-role-persona memory reinforce <id>               # Increment usage count
-
-# Query
-role-persona memory search "query"               # Search (keyword + vector hybrid)
-role-persona memory list                         # List all memories
-
-# Maintenance
-role-persona memory consolidate                  # Deduplicate and organize
-role-persona memory repair                       # Fix markdown format
-role-persona memory tidy                         # Manual tidy
-role-persona memory tidy --llm                   # LLM-powered tidy
-role-persona memory tidy --llm --model openai/gpt-4.1-mini  # Specific model
-
-# Export
-role-persona memory export                       # Export to HTML
-role-persona memory export --output ~/mem.html   # Custom path
-
-# Debug
-role-persona memory conflicts                    # Detect conflicting memories
-role-persona memory log                          # Session operation log
-
-# Stdin-based
-echo '[{"role":"user","content":[{"type":"text","text":"hello"}]' | role-persona memory build-prompt
-echo '[{"role":"user","content":[{"type":"text","text":"hello"}]' | role-persona memory extract-memory
-```
-
-### Knowledge base
-
-```bash
-role-persona knowledge list                      # List all entries
-role-persona knowledge list Architecture         # Filter by category
-role-persona knowledge search "query"            # Search entries
-role-persona knowledge search "query" --tags "tag1,tag2"
-role-persona knowledge read <path>               # Read entry
-role-persona knowledge write --title "Title" --content "Body" [--category Cat] [--tags "t1,t2"]
-```
-
-### Embedding / Vector
-
-```bash
-role-persona embedding stats                     # Vector memory status
-role-persona embedding rebuild                   # Rebuild vector index
-```
-
-### System
-
-```bash
-role-persona init                                # Initialize roles directory
-role-persona prompt                              # Output full system prompt
-role-persona prompt --base "Custom base prompt"  # With custom base
-```
+Streamable HTTP transport at `/mcp`.
 
 ## Configuration
 
-### File location
-
-The config file is searched in this order:
-
-1. `~/.pi/roles/pi-role-persona.jsonc` (recommended)
-2. `~/.pi/agent/pi-role-persona.jsonc`
-3. Extension directory
-4. Current working directory
-
-Create the file at `~/.pi/roles/pi-role-persona.jsonc`:
+Config file: `~/.pi/roles/pi-role-persona.jsonc`
 
 ```jsonc
 {
-  // ── Storage ──
-  "storage": {
-    "rolesDir": "~/.pi/roles"  // Roles directory (default)
-  },
-
-  // ── Auto Memory Extraction ──
-  // Extracts learnings/preferences from conversations automatically
   "autoMemory": {
     "enabled": true,
-    // Model for extraction. Supports multiple formats:
-    //   Single: "provider/model-id"
-    //   Array:  ["provider/model-1", "provider/model-2"]  (fallback chain)
-    //   Object: [{"provider": "openai", "model": "gpt-4.1-mini"}]
-    "model": "openai-codex/gpt-5.1-codex-mini",
-    "tagModel": null,         // Tag extraction model (inherits from model if null)
-    "reserveTokens": 8192,    // Token reserve for extraction
-    "maxItems": 3,            // Max items per extraction
-    "maxText": 200,           // Max text length per item
-    "batchTurns": 5,          // Extract after N turns
-    "minTurns": 2,            // Min turns before extraction
-    "intervalMs": 1800000,    // Extract interval (30 min)
-    "contextOverlap": 4       // Message overlap between extractions
+    "model": [
+      { "provider": "nvidia", "model": "deepseek-ai/deepseek-v4-flash" },
+      { "provider": "modelscope", "model": "ZhipuAI/GLM-5" }
+    ],
+    "batchTurns": 5,
+    "intervalMs": 1800000
   },
-
-  // ── Memory Settings ──
-  "memory": {
-    "defaultCategories": ["Communication", "Code", "Tools", "Workflow", "General"],
-    "dailyPathTemplate": "{rolePath}/memory/daily/{date}.md",
-    "dedupeThreshold": 0.9,   // Similarity threshold for dedup
-    "onDemandSearch": {
-      "enabled": true,        // Search relevant memories on first message
-      "maxResults": 5,
-      "minScore": 0.2,
-      "alwaysLoadHighPriority": true
-    },
-    "searchDefaults": {
-      "maxResults": 20,
-      "minScore": 0.1,
-      "includeDailyMemory": true
-    }
-  },
-
-  // ── Vector Memory ──
   "vectorMemory": {
-    "enabled": false,         // Enable vector search
-    // Provider: "openai" | "local" | "minilm-direct" | "minilm-daemon"
-    "provider": "minilm-daemon",
-    "model": "text-embedding-3-small",
-    "apiKey": null,           // OpenAI API key (for openai provider)
-    "baseUrl": "http://127.0.0.1:52131",  // Local provider URL
-    // MiniLM-specific config (for minilm-* providers)
-    "minilm": {
-      "mode": "daemon",       // "direct" (single-process) or "daemon" (shared)
-      "maxSeqLength": 512,
-      "batchSize": 8,
-      "timeoutMs": 5000,
-      "autoStartDaemon": true,
-      "useGPU": false
-    },
-    "autoRecall": true,       // Inject relevant memories on each message
-    "autoIndex": true,        // Auto-index new memories
-    "hybridSearch": true,     // Combine vector + keyword search
-    "vectorWeight": 1.0,      // Vector score weight in hybrid search
-    "recallLimit": 3,         // Max recalled items
-    "recallMinScore": 0.3,    // Min score for recall
-    "dbPath": ".vector-db"    // LanceDB path (relative to role)
-  },
-
-  // ── Knowledge Base ──
-  "knowledge": {
     "enabled": true,
-    "vectorTable": "knowledge",
-    "search": {
-      "maxResults": 5,
-      "minScore": 0.2,
-      "roleBoost": 1.2        // Score boost for role-specific entries
-    },
-    "externalSources": []     // External readonly knowledge sources
+    "provider": "openai",
+    "model": "text-embedding-3-small",
+    "autoRecall": true,
+    "hybridSearch": true
   },
-
-  // ── External Readonly Memory ──
-  // Inject cross-session memory hints (read-only)
-  "externalReadonly": {
-    "enabled": false,
-    "baseUrl": "http://127.0.0.1:52131",
-    "token": null,
-    "timeoutMs": 1200,
-    "topK": 8,
-    "experienceLimit": 8,
-    "minConfidence": 0.35
+  "knowledge": {
+    "enabled": true
   },
-
-  // ── Logging ──
   "logging": {
     "enabled": true,
-    "level": "debug",         // "debug" | "info" | "warn" | "error"
-    "retentionDays": 7
-  },
-
-  // ── UI ──
-  "ui": {
-    "spinnerIntervalMs": 120,
-    "viewerDefaultFilter": "all"  // "all" | "learnings" | "preferences" | "events"
-  },
-
-  // ── Advanced ──
-  "advanced": {
-    "shutdownFlushTimeoutMs": 1500,
-    "forceKeywords": "结束|总结|退出|收尾|final|summary|wrap\\s?up|quit|exit",
-    "evolutionReminderTurns": 10
+    "level": "info"
   }
 }
 ```
 
-### Environment variables
+Config can be edited via:
+- **Web UI Form mode** — schema-driven form with dropdowns for model selection (reads `models.json`)
+- **Web UI JSONC mode** — raw editor with `jsonc-parser` (comments preserved on edit)
+- **CLI** — `role-persona` commands
 
-All settings can be overridden with environment variables:
+### Environment Variables
 
-| Variable | Config path | Example |
-|----------|-------------|---------|
-| `PI_ROLES_DIR` | storage.rolesDir | `~/.pi/roles` |
-| `ROLE_LOG_LEVEL` | logging.level | `info` |
-| `ROLE_LOG_ENABLED` | logging.enabled | `1` |
-| `ROLE_VECTOR_PROVIDER` | vectorMemory.provider | `minilm-daemon` |
-| `ROLE_VECTOR_ENABLED` | vectorMemory.enabled | `1` |
+| Variable | Description |
+|----------|-------------|
+| `PI_ROLES_DIR` | Override roles directory |
+| `ROLE_AUTO_MEMORY` | Enable/disable auto-memory (`0`/`false`) |
+| `ROLE_AUTO_MEMORY_MODEL` | Override model |
+| `ROLE_LOG` | Enable/disable logging (`0`/`false`) |
+| `OPENAI_API_KEY` | OpenAI API key for embeddings |
 
-### Provider comparison
+## Daemon HTTP API
 
-| Provider | Deps | Dimensions | Memory | Latency | Use case |
-|----------|------|-----------|--------|---------|----------|
-| `openai` | OpenAI API | 1536/3072 | 0 local | ~100ms | Highest quality |
-| `local` | pi-session-manager | 768 | 435MB | ~30ms | Backward compat |
-| `minilm-direct` | onnxruntime-node | 384 | 150MB | ~15ms | Single process |
-| `minilm-daemon` | onnxruntime-node | 384 | 150MB shared | ~20ms | Multi-session (recommended) |
+All responses: `{ "ok": true, "data": ... }` or `{ "ok": false, "error": { "code": "...", "message": "..." } }`
 
-## Data layout
+| Method | Endpoint | Body | Description |
+|--------|----------|------|-------------|
+| GET | `/api/health` | — | Health + instances |
+| GET | `/api/instances` | — | List active instances |
+| GET | `/api/models` | — | Available models from `models.json` |
+| POST | `/api/cwd` | `{role?, cwd?}` | Switch/init context |
+| POST | `/api/init` | `{role?, cwd?}` | Initialize |
+| POST | `/api/role/list` | `{role?}` | List roles |
+| POST | `/api/role/create` | `{name, role?}` | Create role |
+| POST | `/api/role/info` | `{role?}` | Active role info |
+| POST | `/api/memory/list` | `{role?}` | List memory |
+| POST | `/api/memory/search` | `{query, role?}` | Search |
+| POST | `/api/memory/add-learning` | `{content, role?}` | Add learning |
+| POST | `/api/memory/consolidate` | `{role?}` | Consolidate |
+| POST | `/api/memory/repair` | `{role?}` | Repair |
+| POST | `/api/memory/tidy` | `{model?, role?}` | LLM tidy |
+| POST | `/api/knowledge/list` | `{category?, role?}` | List knowledge |
+| POST | `/api/knowledge/search` | `{query, role?}` | Search |
+| POST | `/api/knowledge/read` | `{path, role?}` | Read entry |
+| POST | `/api/knowledge/write` | `{title, content, role?}` | Write entry |
+| POST | `/api/embedding/stats` | `{role?}` | Vector stats |
+| POST | `/api/embedding/rebuild` | `{role?}` | Rebuild index |
+| POST | `/api/file/read` | `{path, role?}` | Read role file |
+| POST | `/api/file/write` | `{path, content, role?}` | Write role file |
+| POST | `/api/file/list` | `{dir, role?}` | List role files |
+| POST | `/api/config/read` | — | Read config |
+| POST | `/api/config/write` | `{content}` | Write config |
+| POST | `/api/prompt` | `{base?, role?}` | Build prompt |
+| POST | `/api/shutdown` | — | Stop daemon |
+
+## Project Structure
 
 ```
-~/.pi/roles/
-├── config.json                    # CWD → role mapping
-├── pi-role-persona.jsonc          # Configuration file
-├── knowledge/                     # Global knowledge base
-│   ├── Architecture/
-│   ├── Code/
-│   └── ...
-└── <role>/                        # e.g. "zero", "default"
-    ├── core/                      # Persona definitions
-    │   ├── agents.md              # Workspace rules
-    │   ├── identity.md            # Name, style, emoji
-    │   ├── soul.md                # Personality, values
-    │   ├── user.md                # User profile
-    │   ├── tools.md               # Tool preferences
-    │   ├── heartbeat.md           # Proactive check rules
-    │   └── constraints.md         # Hard boundaries
-    ├── memory/
-    │   ├── consolidated.md        # Long-term structured memory
-    │   ├── pending.md             # Verification buffer
-    │   └── daily/                 # Daily logs
-    │       ├── 2026-01-15.md
-    │       └── 2026-01-16.md
-    ├── knowledge/                 # Role-specific knowledge
-    ├── context/                   # Session context
-    ├── skills/                    # Role skills
-    ├── archive/                   # Old memories
-    └── .vector-db/                # LanceDB vector index
-
-~/.pi/
-├── role-persona-daemon.pid        # Daemon PID file
-├── role-persona-daemon.port       # Daemon port file
-├── sockets/                       # Embedding daemon IPC
-│   └── embedding-daemon.sock
-└── models/                        # ONNX models
-    └── all-MiniLM-L6-v2/
-        └── model.onnx (~80MB)
+role-persona/
+├── src/
+│   ├── core/                    # Pure logic, zero Pi dependency
+│   │   ├── types.ts             # Shared types (ModelRegistry, LlmCaller, ApiKeyResolver...)
+│   │   ├── config.ts            # JSONC config loader
+│   │   ├── logger.ts            # JSONL structured logging
+│   │   ├── role-store.ts        # Role CRUD, CWD mapping
+│   │   ├── memory-md.ts         # Markdown memory CRUD
+│   │   ├── memory-llm.ts        # LLM auto-extraction
+│   │   ├── memory-tags.ts       # LLM tag extraction
+│   │   ├── memory-vector.ts     # Vector search orchestration
+│   │   ├── embedding.ts         # Embedding providers (OpenAI/Local/MiniLM)
+│   │   ├── vector-db.ts         # LanceDB wrapper
+│   │   └── knowledge.ts         # Knowledge base CRUD
+│   ├── service/                 # Unified facade
+│   │   ├── context.ts           # ServiceContext
+│   │   ├── index.ts             # RolePersonaService
+│   │   └── *-service.ts         # Sub-services
+│   ├── extensions/pi/
+│   │   └── adapter.ts           # Pi extension (direct service + Pi SDK)
+│   ├── transport/
+│   │   ├── daemon.ts            # HTTP daemon (ServiceManager + multiplexing + static Web UI)
+│   │   ├── mcp-server.ts        # MCP Streamable HTTP
+│   │   └── tui-renderers.ts     # Pi TUI renderers
+│   └── bin/
+│       ├── cli.ts               # CLI entry (--web, --cwd, --direct)
+│       └── daemon.ts            # Daemon entry
+├── tests/
+│   ├── memory-md.test.ts        # Memory CRUD tests (26/26)
+│   ├── core.test.ts             # Core types/config tests
+│   ├── cli.test.ts              # CLI integration tests
+│   └── mcp.test.ts              # MCP protocol tests
+├── web/                         # React dashboard
+│   ├── src/
+│   │   ├── api/client.ts        # Daemon API client (role-based)
+│   │   ├── i18n/                # en.json, zh.json
+│   │   ├── hooks/
+│   │   │   ├── useApi.ts        # API call hook with loading/error state
+│   │   │   └── useUrlState.ts   # URL search param persistence
+│   │   ├── components/
+│   │   │   ├── Layout.tsx       # Sidebar + topbar + role selector
+│   │   │   ├── MarkdownViewer.tsx # Markdown + syntax highlight + edit
+│   │   │   ├── JsoncForm.tsx    # Schema-driven JSONC form editor
+│   │   │   ├── StatCard.tsx     # Dashboard stat card
+│   │   │   └── EmptyState.tsx   # Empty state placeholder
+│   │   └── pages/
+│   │       ├── Dashboard.tsx    # Stats overview with clickable cards
+│   │       ├── Memory.tsx       # Explorer tree + table + Markdown
+│   │       ├── Knowledge.tsx    # List + search + Markdown view
+│   │       ├── Roles.tsx        # Role grid + detail modal
+│   │       └── Settings.tsx     # Config editor + daemon status
+│   └── package.json
+├── templates/
+│   └── memory-export.html       # HTML export template
+└── README.md
 ```
 
-## Testing
+## Memory System
+
+### Types
+
+| Type | Description | Auto-Extracted |
+|------|-------------|----------------|
+| **Learning** | Cross-session insights | ✓ |
+| **Preference** | User preferences | ✓ |
+| **Event** | Session events | — |
+| **Pending** | Awaiting verification | ✓ |
+
+### Lifecycle
+
+```
+Conversation → Auto-Extract → Pending Layer → Verify → Consolidated
+                                    ↓
+                              Use-driven value
+```
+
+### Vector Memory
+
+- **LanceDB** vector storage
+- **Hybrid search**: vector + keyword → RRF fusion
+- **Auto-index** on write
+- **Auto-recall** at session start
+- **Embedding providers**: OpenAI, local, MiniLM (ONNX)
+
+### Scenario Memory (L2)
+
+Scenario memory records “what to do in a recurring situation”. It sits between pending atomic facts and consolidated persona guidance, and is useful for code review formats, release procedures, debugging SOPs, and preferred report structures.
 
 ```bash
-bun test
-# 31 pass, 0 fail, 90 assertions, ~6s
+role-persona memory scenario-write \
+  --title "Code review output" \
+  --guidance "Give the conclusion first, then group findings by Critical/Medium/Low. Explain impact and fix for each item." \
+  --triggers "code review,review feedback" \
+  --evidence "User prefers structured severity-based review feedback"
+
+role-persona memory scenario-search "review this PR"
 ```
 
-| Suite | Tests | Coverage |
-|-------|-------|----------|
-| CLI | 18 | All commands, JSON output, error handling |
-| MCP | 7 | Streamable HTTP, initialize, tools, sessions |
-| Core | 6 | Types, extraction rules, config |
+When building a prompt, role-persona performs on-demand recall from the user query. Matching scenarios are injected as `Scenario Memory Hints`. They are hints, not commands, and never override explicit user instructions.
+
+### Fusion design
+
+If you are looking at Tencent's newly discussed auto-memory approach, start here:
+
+- [`docs/MEMORY-FUSION-DESIGN.md`](./docs/MEMORY-FUSION-DESIGN.md) — maps TencentDB Agent Memory's layered long-term memory, symbolic short-term memory, and traceable drill-down model onto role-persona's daily / pending / consolidated / vector system.
+
+## Logging
+
+JSONL structured logging: `~/.pi/roles/.log/YYYY-MM-DD.jsonl`
+
+```json
+{"schema":"2.0.0","timestamp":"2026-05-07T00:16:00Z","level":"info","scope":"auto-extract","message":"start"}
+```
 
 ## Development
 
 ```bash
-# Install deps
-bun install
-
-# Run CLI
-bun src/bin/cli.ts --help
-
-# Run daemon
-bun src/bin/daemon.ts --background
-
-# Run MCP server
-bun src/transport/mcp-server.ts
-
-# Run tests
-bun test
-
-# Type check
-bun x tsc --noEmit
+bun run typecheck        # Type check
+bun run test             # All tests (57 tests, 55 pass)
+bun test tests/memory-md.test.ts  # Memory module tests (26/26)
+bun src/bin/cli.ts ...   # CLI dev
+bun src/transport/daemon.ts  # Daemon dev
+cd web && bun run dev    # Web dev (Vite HMR)
 ```
+
+### Test Coverage
+
+| Module | Tests | Status |
+|--------|-------|--------|
+| `memory-md.ts` | 26 | ✅ CRUD, search, dedup, pending layer |
+| `core.test.ts` | 11 | ✅ Types, config, extraction rules |
+| `cli.test.ts` | 18 | ⚠️ 16/18 (2 pre-existing: embedding not active) |
+| `mcp.test.ts` | 6 | ✅ MCP protocol |
 
 ## License
 
-MIT
+MIT © Dwsy

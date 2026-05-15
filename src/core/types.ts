@@ -142,7 +142,7 @@ export interface RoleConfig {
 
 export interface RoleResolution {
   role: string | null;
-  source: "mapping" | "disabled" | "default" | "none";
+  source: "mapped" | "disabled" | "default" | "none";
   matchedPath?: string;
 }
 
@@ -189,6 +189,7 @@ export interface RoleMemoryMetadata {
 }
 
 export interface RoleMemoryData {
+  rolePath?: string;
   roleName: string;
   metadata: RoleMemoryMetadata;
   autoExtracted: boolean;
@@ -248,6 +249,7 @@ export interface MemoryResult {
   duplicate?: boolean;
   tags?: string[];
   text?: string;
+  layer?: "pending" | "consolidated";
 }
 
 export interface UpdateResult {
@@ -449,6 +451,28 @@ export interface KnowledgeSearchParams {
 }
 
 // ============================================================================
+// Scenario Memory Types
+// ============================================================================
+
+export interface MemoryScenarioInput {
+  title: string;
+  triggers?: string[];
+  scope?: string;
+  guidance: string;
+  evidence?: string[];
+}
+
+export interface MemoryScenarioRecord extends MemoryScenarioInput {
+  id: string;
+  updated: string;
+  path: string;
+}
+
+export interface MemoryScenarioSearchMatch extends MemoryScenarioRecord {
+  score: number;
+}
+
+// ============================================================================
 // Embedding / Vector Types
 // ============================================================================
 
@@ -558,6 +582,57 @@ export interface DirectoryListing {
 export interface Message {
   role: "user" | "assistant" | "system";
   content: Array<{ type: string; text?: string; thinking?: string }>;
+}
+
+// ============================================================================
+// LLM / Model Abstraction (replaces ExtensionContext dependency)
+// ============================================================================
+
+/** Minimal model info returned by the registry */
+export interface ModelInfo {
+  provider: string;
+  id: string;
+  name?: string;
+  maxTokens?: number;
+  [key: string]: unknown;
+}
+
+/** API key resolution result */
+export interface ApiKeyResult {
+  ok: boolean;
+  apiKey?: string;
+}
+
+/** Model registry — plugin provides, core consumes. Replaces ctx.modelRegistry. */
+export interface ModelRegistry {
+  getAll(): ModelInfo[];
+  getApiKeyAndHeaders(model: ModelInfo): Promise<ApiKeyResult>;
+}
+
+/** LLM completion response (mirrors pi-ai complete() result shape) */
+export interface LlmCompletionResult {
+  content: Array<{ type: string; text?: string; thinking?: string }>;
+  stopReason?: string;
+  errorMessage?: string;
+  [key: string]: unknown;
+}
+
+/** LLM completion options */
+export interface LlmCompletionOptions {
+  apiKey: string;
+  maxTokens?: number;
+}
+
+/** LLM caller — plugin injects this for LLM operations */
+export interface LlmCaller {
+  complete(model: ModelInfo, request: { messages: Array<{ role: "user"; content: Array<{ type: "text"; text: string }>; timestamp: number }> }, options: LlmCompletionOptions): Promise<LlmCompletionResult>;
+  convertToLlm(messages: unknown[]): Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+  serializeConversation(messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>): string;
+}
+
+/** API key resolver — plugin injects for vector memory */
+export interface ApiKeyResolver {
+  resolve(provider?: string): Promise<string | null>;
 }
 
 /** Tool call result — compatible with Pi, MCP, and CLI */

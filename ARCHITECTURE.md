@@ -104,18 +104,31 @@ role-persona/
 
 ## Runtime Modes
 
-### 1. Pi Extension (backward compatible)
+### 1. Pi Extension (direct service mode)
 
 ```typescript
 // extensions/role-persona/index.ts
-export { default } from "role-persona/src/transport/pi-adapter.ts";
+export { default } from "../../role-persona/src/extensions/pi/adapter.ts";
 ```
 
-The adapter delegates all operations to the CLI via `cli-runner.ts`:
-- If daemon is running → HTTP call (~5ms)
-- If daemon is not running → subprocess spawn (~250ms)
+The adapter calls the service layer directly — zero CLI subprocess dependency:
+- Registers tools: `memory`, `knowledge`, `role_info`
+- Registers commands: `/role`, `/memories`, `/memory-log`, `/memory-fix`, `/memory-tidy`, `/memory-tidy-llm`, `/memory-vector`, `/memory-export`, `/memory-conflicts`, `/memory-distill`, `/memory-distill-stop`, `/memory-tags`, `/kb`
+- Handles events: `session_start`, `before_agent_start`, `agent_end`, `session_before_compact`, `session_shutdown`, `turn_end`
 
-Zero imports from service/core layers.
+Key features:
+- On-demand memory search on first message (vector + keyword hybrid)
+- Vector auto-recall injection into system prompt
+- External readonly memory hints (configurable via `externalReadonly` config)
+- Compaction memory extraction (`<memory>` block parsing → learning/preference/event/knowledge)
+- Interactive memory→knowledge distillation mode
+- TUI role selector and memory viewer (when available)
+- HTTP memory server for browser-based browsing
+- Auto-repair and pending expiration on role activation
+- Prompt cache with 5-minute TTL
+- LLM retry with exponential backoff
+
+An alternative CLI-delegating adapter exists at `src/transport/pi-adapter.ts` for backward compatibility.
 
 ### 2. CLI
 
@@ -324,11 +337,13 @@ bun test
 
 ## Refactored From
 
-Original: `extensions.disabled/role-persona-cli/` (13,424 lines, single-file god object)
+Original: `extensions/role-persona-old/` (101KB, single-file god object)
 
 Key improvements:
-- `index.ts` 2,496 lines → `pi-adapter.ts` 532 lines (79% reduction)
-- Zero service/core imports in Pi adapter (CLI subprocess delegation)
+- `index.ts` 2,496 lines → `extensions/pi/adapter.ts` + `service/` layer (clean separation)
+- Direct service calls instead of CLI subprocess delegation
+- All 13 commands, 7 events, 3 tools fully aligned with old version
+- New features: prompt cache, LLM retry, external readonly memory
 - 4 runtime modes vs original 1
 - 31 automated tests vs original 0
 - Full daemon mode with single-instance PID management
