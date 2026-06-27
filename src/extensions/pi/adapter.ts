@@ -16,6 +16,7 @@
 // Pi SDK imports — resolved from pi-mono at runtime
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 
 const PI_MONO = join(homedir(), ".pi", "pi-mono", "packages");
 
@@ -58,10 +59,16 @@ import type {
   ApiKeyResolver,
   Message,
 } from "../../core/types.ts";
-import { setSessionId } from "../../core/logger.ts";
+import { setCurrentRole, setSessionId } from "../../core/logger.ts";
 
 import { createService, type RolePersonaService, type ServiceOptions } from "../../service/index.ts";
 import { loadConfig } from "../../core/config.ts";
+import {
+  knowledgeToolRenderers,
+  memoryToolRenderers,
+  registerRoleMessageRenderers,
+  roleInfoToolRenderers,
+} from "../../transport/tui-renderers.ts";
 
 // Pi TUI imports
 let _tui: any = null;
@@ -242,9 +249,25 @@ function createApiKeyResolver(ctx: ExtensionContext): ApiKeyResolver {
 
 let _service: RolePersonaService | null = null;
 let _serviceReady = false;
+let _serviceKey: string | null = null;
+
+function getSessionId(ctx: ExtensionContext): string {
+  return (ctx as any).sessionManager?.getSessionId?.() || "";
+}
+
+function getServiceKey(ctx: ExtensionContext): string {
+  const cwd = ctx.cwd || process.cwd();
+  const modelKey = ctx.model ? `${ctx.model.provider || ""}/${ctx.model.id || ""}` : "";
+  return `${getSessionId(ctx)}|${cwd}|${modelKey}`;
+}
 
 async function getService(ctx: ExtensionContext): Promise<RolePersonaService | null> {
-  if (_service && _serviceReady) return _service;
+  const key = getServiceKey(ctx);
+  if (_service && _serviceReady && _serviceKey === key) return _service;
+
+  if (_service && _serviceReady && _serviceKey !== key) {
+    await disposeService();
+  }
 
   try {
     const config = loadConfig();
@@ -269,8 +292,10 @@ async function getService(ctx: ExtensionContext): Promise<RolePersonaService | n
     };
 
     _service = createService(opts);
-    await _service.init(ctx.cwd);
+    const init = await _service.init(ctx.cwd || process.cwd());
+    setCurrentRole(init.role?.name || "-");
     _serviceReady = true;
+    _serviceKey = key;
     return _service;
   } catch (err) {
     safeError(ctx, "service-init", err);
@@ -285,6 +310,8 @@ async function disposeService(): Promise<void> {
     } catch {}
     _service = null;
     _serviceReady = false;
+    _serviceKey = null;
+    setCurrentRole("-");
   }
 }
 
@@ -301,6 +328,7 @@ function toolErr(text: string) {
 
 // ── Shared state ──
 let memoryDistillMode: { active: boolean; requestedModel?: string } | null = null;
+let invalidatePromptCache = () => {};
 
 // ── Tool Registration ────────────────────────────────────────────────────
 
@@ -404,6 +432,7 @@ function registerTools(pi: ExtensionAPI) {
         return toolErr(`memory tool failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
+    ...memoryToolRenderers,
   });
 
   // ── knowledge ──
@@ -464,6 +493,7 @@ function registerTools(pi: ExtensionAPI) {
         return toolErr(`knowledge tool failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
+    ...knowledgeToolRenderers,
   });
 
   // ── role_info ──
@@ -476,18 +506,22 @@ function registerTools(pi: ExtensionAPI) {
       recursive: Type.Optional(Type.Boolean()),
       maxEntries: Type.Optional(Type.Number()),
     }),
-    async execute(_toolCallId: string, _params: Record<string, any>, _signal?: any, _onUpdate?: any, ctx?: any) {
+    async execute(_toolCallId: string, params: Record<string, any>, _signal?: any, _onUpdate?: any, ctx?: any) {
       try {
         const service = await getService(ctx);
         if (!service) return toolErr("Service not initialized");
         const role = service.getActiveRole();
         if (!role) return toolErr("No active role");
-        const listing = service.role.getStructure(role.path);
+        const listing = service.role.getStructure(role.path, params.path, {
+          recursive: params.recursive,
+          maxEntries: params.maxEntries,
+        });
         return toolOk(listing);
       } catch (error) {
         return toolErr(`role_info failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     },
+    ...roleInfoToolRenderers,
   });
 }
 
@@ -583,6 +617,8 @@ function registerCommands(pi: ExtensionAPI) {
           const r = service.role.create(name);
           if (r.ok) {
             service.role.map(cwd, name);
+            setCurrentRole(name);
+            invalidatePromptCache();
             notify(ctx, `Created & mapped: ${name}`, "success");
           } else {
             notify(ctx, `Role exists: ${name}`, "warning");
@@ -632,11 +668,15 @@ function registerCommands(pi: ExtensionAPI) {
           }
           if (!name) { notify(ctx, "Usage: /role map <name>", "warning"); return; }
           const r = service.role.map(cwd, name);
+          setCurrentRole(name);
+          invalidatePromptCache();
           notify(ctx, r.ok ? `Mapped: ${cwd} → ${name}` : "Map failed", r.ok ? "success" : "error");
           break;
         }
         case "unmap": {
           const r = service.role.unmap(cwd);
+          setCurrentRole("-");
+          invalidatePromptCache();
           notify(ctx, r.ok ? "Unmapped" : "Unmap failed", r.ok ? "info" : "error");
           break;
         }
@@ -773,12 +813,16 @@ function registerCommands(pi: ExtensionAPI) {
 
   // ── /memory-export ──
   safeCommand("memory-export", {
-    description: "Export memory to HTML",
-    handler: async (_args: string, ctx: ExtensionContext) => {
+    description: "Export memory to HTML: /memory-export [path]",
+    handler: async (args: string, ctx: ExtensionContext) => {
       const service = await getService(ctx);
       if (!service) { notify(ctx, "Service not initialized", "error"); return; }
-      service.memory.exportHtml();
-      notify(ctx, "Memory exported", "success");
+      const role = service.getActiveRole();
+      if (!role) { notify(ctx, "No active role", "warning"); return; }
+      const exportPath = (args || "").trim() || join(role.path, "memory-export.html");
+      const html = service.memory.exportHtml(exportPath);
+      writeFileSync(exportPath, html, "utf-8");
+      notify(ctx, `Memory exported: ${exportPath}`, "success");
     },
   });
 
@@ -812,6 +856,7 @@ function registerCommands(pi: ExtensionAPI) {
 
       const requestedModel = (args || "").trim() || undefined;
       memoryDistillMode = { active: true, requestedModel };
+      invalidatePromptCache();
 
       const intro = [
         `# Memory Distill Mode — ${role.name}`,
@@ -842,6 +887,7 @@ function registerCommands(pi: ExtensionAPI) {
     description: "Disable interactive memory→knowledge distillation mode",
     handler: async (_args: string, ctx: ExtensionContext) => {
       memoryDistillMode = null;
+      invalidatePromptCache();
       notify(ctx, "已关闭 memory-distill 模式", "success");
     },
   });
@@ -984,6 +1030,10 @@ function registerEvents(pi: ExtensionAPI) {
   let _cachedPrompt: string | null = null;
   let _promptCacheAt = 0;
   const PROMPT_CACHE_TTL = 5 * 60 * 1000;
+  invalidatePromptCache = () => {
+    _cachedPrompt = null;
+    _promptCacheAt = 0;
+  };
 
   // ── before_agent_start ──
   pi.on("before_agent_start", async (event, ctx) => {
@@ -1254,6 +1304,7 @@ Rules:
 // ── Main Extension Export ─────────────────────────────────────────────────
 
 export default function rolePersonaExtension(pi: ExtensionAPI) {
+  try { registerRoleMessageRenderers(pi); } catch (err) { safeError(undefined, "register_renderers", err); }
   try { registerTools(pi); } catch (err) { safeError(undefined, "register_tools", err); }
   try { registerCommands(pi); } catch (err) { safeError(undefined, "register_commands", err); }
   try { registerEvents(pi); } catch (err) { safeError(undefined, "register_events", err); }

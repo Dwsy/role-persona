@@ -476,6 +476,134 @@ export function listKnowledge(rolePath: string | null): KnowledgeListResult {
   return { sources, tagIndex, totalEntries: allEntries.length };
 }
 
+// ============================================================================
+// Tag Cloud
+// ============================================================================
+
+export interface TagCloudItem {
+  name: string;
+  count: number;
+  /** Normalized size (0-1) for visualization */
+  size: number;
+  /** Categories this tag appears in */
+  categories: string[];
+}
+
+export interface TagCloudResult {
+  tags: TagCloudItem[];
+  totalCount: number;
+  topTags: string[];
+}
+
+/**
+ * Generate a tag cloud from all knowledge entries.
+ */
+export function buildKnowledgeTagCloud(
+  rolePath: string | null,
+  opts?: { limit?: number; minCount?: number }
+): TagCloudResult {
+  const limit = opts?.limit ?? 20;
+  const minCount = opts?.minCount ?? 1;
+
+  const knowledge = listKnowledge(rolePath);
+  const tagCounts = new Map<string, { count: number; categories: Set<string> }>();
+
+  // Count tags across all sources
+  for (const source of knowledge.sources) {
+    for (const category of source.categories) {
+      for (const entry of category.entries) {
+        for (const tag of entry.tags) {
+          const key = tag.toLowerCase();
+          const existing = tagCounts.get(key);
+          if (existing) {
+            existing.count++;
+            existing.categories.add(category.category);
+          } else {
+            tagCounts.set(key, { count: 1, categories: new Set([category.category]) });
+          }
+        }
+      }
+    }
+  }
+
+  // Convert to array and sort by count
+  const items: TagCloudItem[] = Array.from(tagCounts.entries())
+    .map(([name, data]) => ({
+      name,
+      count: data.count,
+      size: 0, // Will be calculated below
+      categories: Array.from(data.categories),
+    }))
+    .filter(item => item.count >= minCount)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+
+  // Calculate normalized sizes (0-1)
+  if (items.length > 0) {
+    const maxCount = items[0].count;
+    for (const item of items) {
+      item.size = item.count / maxCount;
+    }
+  }
+
+  return {
+    tags: items,
+    totalCount: tagCounts.size,
+    topTags: items.slice(0, 5).map(i => i.name),
+  };
+}
+
+/**
+ * Format tag cloud as markdown string.
+ */
+export function formatTagCloudMarkdown(cloud: TagCloudResult): string {
+  if (cloud.tags.length === 0) {
+    return "*No tags found in knowledge base.*";
+  }
+
+  const lines = ["## 🏷️ Knowledge Tag Cloud", ""];
+
+  // Top tags as prominent items
+  if (cloud.topTags.length > 0) {
+    lines.push("**Top Tags:** " + cloud.topTags.map(t => `\`${t}\``).join(", "));
+    lines.push("");
+  }
+
+  // All tags with counts
+  lines.push("### All Tags");
+  lines.push("");
+
+  for (const tag of cloud.tags) {
+    const bar = "█".repeat(Math.max(1, Math.round(tag.size * 10)));
+    const categories = tag.categories.length > 0 ? ` (${tag.categories.join(", ")})` : "";
+    lines.push(`- \`${tag.name}\` ${bar} **${tag.count}**${categories}`);
+  }
+
+  lines.push("");
+  lines.push(`*Total unique tags: ${cloud.totalCount}*`);
+
+  return lines.join("\n");
+}
+
+/**
+ * Format tag cloud as HTML for visualization.
+ */
+export function formatTagCloudHtml(cloud: TagCloudResult): string {
+  if (cloud.tags.length === 0) {
+    return '<div class="tag-cloud-empty">No tags found</div>';
+  }
+
+  const colors = ["#6366f1", "#8b5cf6", "#a855f7", "#d946ef", "#ec4899", "#f43f5e", "#ef4444"];
+
+  const items = cloud.tags.map((tag, i) => {
+    const color = colors[i % colors.length];
+    const fontSize = 0.8 + tag.size * 0.8; // 0.8rem to 1.6rem
+    return `<span class="tag-cloud-item" style="font-size:${fontSize}rem;color:${color}" title="${tag.count} entries in ${tag.categories.join(", ")}">${tag.name}</span>`;
+  }).join("\n");
+
+  return `<div class="tag-cloud">\n${items}\n</div>`;
+}
+
 /**
  * Read a single knowledge entry by relative path.
  * Tries global → role → external sources in order.

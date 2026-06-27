@@ -73,6 +73,7 @@ export interface VectorMemoryConfig {
   baseUrl: string;
   minilm?: MiniLMConfig;
   autoRecall: boolean;
+  smartRecall?: boolean;
   autoIndex: boolean;
   recallLimit: number;
   recallMinScore: number;

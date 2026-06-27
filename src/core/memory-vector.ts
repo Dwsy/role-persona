@@ -164,6 +164,112 @@ export function disposeVectorMemory(): void {
 }
 
 // ============================================================================
+// Incremental Index Updates
+// ============================================================================
+
+export type IndexAction = "add" | "update" | "delete";
+
+export interface IncrementalIndexResult {
+  action: IndexAction;
+  id: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Incremental index update: add, update, or delete a single entry.
+ * More efficient than full rebuild for small changes.
+ */
+export async function incrementalIndex(
+  id: string,
+  text: string,
+  action: IndexAction,
+  kind: "learning" | "preference" = "learning",
+  category: string = "",
+): Promise<IncrementalIndexResult> {
+  if (!activeDB || !activeEmbedding) {
+    return { action, id, success: false, error: "vector memory not active" };
+  }
+
+  try {
+    switch (action) {
+      case "add":
+      case "update": {
+        const vector = await activeEmbedding.embed(text);
+        await activeDB.store({
+          id,
+          text,
+          vector,
+          kind,
+          category,
+          createdAt: Date.now(),
+        });
+        log("vector-index", `${action} entry: ${id}`);
+        return { action, id, success: true };
+      }
+      case "delete": {
+        await activeDB.delete(id);
+        log("vector-index", `delete entry: ${id}`);
+        return { action, id, success: true };
+      }
+    }
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    log("vector-index", `${action} failed for ${id}: ${errorMsg}`);
+    return { action, id, success: false, error: errorMsg };
+  }
+}
+
+/**
+ * Batch incremental update: process multiple changes at once.
+ */
+export async function batchIncrementalIndex(
+  operations: Array<{
+    id: string;
+    text: string;
+    action: IndexAction;
+    kind?: "learning" | "preference";
+    category?: string;
+  }>,
+): Promise<IncrementalIndexResult[]> {
+  const results: IncrementalIndexResult[] = [];
+
+  for (const op of operations) {
+    const result = await incrementalIndex(
+      op.id,
+      op.text,
+      op.action,
+      op.kind ?? "learning",
+      op.category ?? "",
+    );
+    results.push(result);
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  log("vector-index", `batch update: ${successCount}/${results.length} succeeded`);
+
+  return results;
+}
+
+/**
+ * Check if an entry exists in the vector index.
+ */
+export async function vectorIndexContains(id: string): Promise<boolean> {
+  if (!activeDB) return false;
+
+  try {
+    const count = await activeDB.count();
+    if (count === 0) return false;
+
+    // Search for the entry by ID (using a simple query)
+    const results = await activeDB.search(new Array(activeEmbedding?.dim ?? 384).fill(0), count, 0);
+    return results.some(r => r.entry.id === id);
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================================
 // Search
 // ============================================================================
 
@@ -254,7 +360,141 @@ export async function hybridSearch(
 }
 
 // ============================================================================
-// Auto-Recall
+// Intent Detection & Smart Recall
+// ============================================================================
+
+export type RecallIntent = "learning" | "preference" | "tool" | "scenario" | "general";
+
+/**
+ * Detect user intent from query text.
+ * Returns intent category for targeted recall.
+ */
+export function detectRecallIntent(query: string): RecallIntent {
+  const q = query.toLowerCase();
+
+  // Learning intent: user wants to learn/know something
+  if (/^(怎么|如何|为什么|是什么|原理|概念|学习|了解|知道|记住|教育|教学)/.test(q) ||
+      /(怎么|如何|为什么|是什么|原理|概念|学习|了解|知道|记住|教育|教学)[？?\s]/.test(q)) {
+    return "learning";
+  }
+
+  // Preference intent: user asking about preferences
+  if (/^(喜欢|偏好|习惯|喜欢用|更喜欢|最好|推荐|首选)/.test(q) ||
+      /(喜欢|偏好|习惯|喜欢用|更喜欢|最好|推荐|首选)[？?\s]/.test(q) ||
+      /喜欢.*什么/.test(q) || /什么.*喜欢/.test(q)) {
+    return "preference";
+  }
+
+  // Tool intent: user asking about tools/commands
+  if (/^(工具|命令|运行|执行|安装|配置)/.test(q) ||
+      /(工具|命令|运行|执行|安装|配置|npm|pnpm|bun|node|python)[？?\s]/.test(q)) {
+    return "tool";
+  }
+
+  // Scenario intent: user describing a situation
+  if (/^(场景|情况|当时|那次|之前|上次|项目中)/.test(q) ||
+      /(场景|情况|当时|那次|之前|上次|项目中)[？?\s]/.test(q)) {
+    return "scenario";
+  }
+
+  return "general";
+}
+
+/**
+ * Smart recall with intent-based strategy.
+ * Adjusts recall parameters based on detected intent.
+ */
+export async function smartAutoRecall(
+  query: string,
+  opts?: {
+    limit?: number;
+    minScore?: number;
+    intent?: RecallIntent;
+    rolePath?: string;
+    roleName?: string;
+  },
+): Promise<string | null> {
+  if (!activeDB || !activeEmbedding) return null;
+
+  const intent = opts?.intent || detectRecallIntent(query);
+  const limit = opts?.limit ?? config.vectorMemory?.recallLimit ?? 5;
+  const minScore = opts?.minScore ?? config.vectorMemory?.recallMinScore ?? 0.3;
+
+  log("smart-recall", `intent=${intent}, query="${query.slice(0, 50)}..."`);
+
+  // Adjust parameters based on intent
+  const adjustedOpts = getRecallParamsByIntent(intent, limit, minScore);
+
+  // Hybrid recall: vector + keyword
+  const rolePath = opts?.rolePath || activeRolePath || "";
+  const roleName = opts?.roleName || "default";
+  const results = await hybridSearch(rolePath, roleName, query, adjustedOpts.limit);
+
+  // Filter by adjusted min score
+  const filtered = results.filter((r) => r.score >= adjustedOpts.minScore);
+
+  if (filtered.length === 0) return null;
+
+  // Format with intent-specific header
+  return formatSmartRecallBlock(filtered, intent);
+}
+
+/**
+ * Get recall parameters adjusted for specific intent.
+ */
+function getRecallParamsByIntent(
+  intent: RecallIntent,
+  defaultLimit: number,
+  defaultMinScore: number,
+): { limit: number; minScore: number } {
+  switch (intent) {
+    case "learning":
+      // Be more aggressive: lower threshold, more results
+      return { limit: defaultLimit + 2, minScore: Math.max(defaultMinScore - 0.1, 0.2) };
+    case "preference":
+      // Strict: only high-confidence preferences
+      return { limit: defaultLimit, minScore: Math.max(defaultMinScore + 0.05, 0.35) };
+    case "tool":
+      // Tool-focused: prefer tool-related memories
+      return { limit: defaultLimit, minScore: defaultMinScore };
+    case "scenario":
+      // Scenario: include more context
+      return { limit: defaultLimit + 1, minScore: defaultMinScore };
+    default:
+      return { limit: defaultLimit, minScore: defaultMinScore };
+  }
+}
+
+/**
+ * Format recall results with intent-specific header.
+ */
+function formatSmartRecallBlock(
+  results: ScoredMemoryMatch[],
+  intent: RecallIntent,
+): string {
+  if (results.length === 0) return "";
+
+  const intentLabels: Record<RecallIntent, string> = {
+    learning: "📚 Learning Context",
+    preference: "💡 Your Preferences",
+    tool: "🔧 Tool Knowledge",
+    scenario: "🎯 Scenario Context",
+    general: "🧠 Recalled Memories",
+  };
+
+  const lines = [`## ${intentLabels[intent]}`, ""];
+
+  for (const r of results) {
+    const score = Math.round(r.score * 100);
+    const icon = r.kind === "learning" ? "📝" : r.kind === "preference" ? "⭐" : "📌";
+    lines.push(`- ${icon} [${score}%] ${r.text}`);
+  }
+
+  return lines.join("\n");
+}
+
+// ============================================================================
+// Auto-Recall (backward compatible)
 // ============================================================================
 
 export function formatRecalledMemories(results: VectorSearchResult[]): string {
@@ -275,6 +515,12 @@ export async function autoRecall(
 ): Promise<string | null> {
   if (!activeDB || !activeEmbedding) return null;
 
+  // Use smart recall if enabled
+  if (config.vectorMemory?.smartRecall !== false) {
+    return smartAutoRecall(query, { limit, minScore });
+  }
+
+  // Fallback to basic recall
   const results = await vectorSearch(activeRolePath || "", query, limit, minScore);
   if (results.length === 0) return null;
 
@@ -344,5 +590,4 @@ export async function getVectorStats(): Promise<VectorStats | null> {
     dbPath: activeRolePath ? getVectorDBPath(activeRolePath) : null,
   };
 }
-
 

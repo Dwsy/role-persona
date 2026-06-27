@@ -253,7 +253,7 @@ async function cmdKnowledgeDirect(svc: RolePersonaService, sub: string, args: st
 async function cmdEmbeddingDirect(svc: RolePersonaService, sub: string) {
   svc.getActiveRole() || fail("No active role");
   switch (sub) {
-    case "stats": { ok(await svc.embedding.stats() ?? { active: false }); break; }
+    case "stats": { ok(await svc.embedding.stats() ?? { enabled: svc.getConfig().vectorMemory.enabled, active: false, model: null, dim: null, count: 0, dbPath: null }); break; }
     case "rebuild": { ok(await svc.embedding.rebuild()); break; }
     default: fail(`Unknown embedding sub: ${sub}`);
   }

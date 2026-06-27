@@ -1,8 +1,8 @@
 {
   "name": "role-persona",
-  "version": "1.0.2",
+  "version": "1.0.6",
   "type": "module",
-  "description": "Role-based persona system for AI agents — memory, knowledge, embedding. CLI, MCP, daemon, Pi extension.",
+  "description": "Role-based persona system for AI agents \u2014 memory, knowledge, embedding. CLI, MCP, daemon, Pi extension, Cline SDK plugin.",
   "author": "Dwsy",
   "license": "MIT",
   "repository": {
@@ -23,7 +23,9 @@
     "mcp",
     "cli",
     "pi",
-    "role"
+    "role",
+    "pi-package",
+    "cline"
   ],
   "engines": {
     "bun": ">=1.0.0",
@@ -39,6 +41,10 @@
     ".": {
       "import": "./dist/service/index.js",
       "types": "./dist/service/index.d.ts"
+    },
+    "./pi-extension": {
+      "import": "./dist/extensions/pi/adapter.js",
+      "types": "./dist/extensions/pi/adapter.d.ts"
     },
     "./cli": {
       "import": "./dist/bin/cli.js",
@@ -59,29 +65,49 @@
     "./core": {
       "import": "./dist/core/index.js",
       "types": "./dist/core/index.d.ts"
+    },
+    "./cline-extension": {
+      "import": "./dist/extensions/cline/adapter.js",
+      "types": "./dist/extensions/cline/adapter.d.ts"
     }
   },
   "files": [
     "dist",
+    "src",
+    "skills",
+    "templates",
+    "web/dist",
+    "index.ts",
     "README.md",
     "README.zh-CN.md",
-    "LICENSE",
-    "templates"
+    "LICENSE"
   ],
+  "pi": {
+    "extensions": [
+      "src/extensions/pi/adapter.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  },
   "scripts": {
-    "build": "bun run build:clean && bun run build:cli && bun run build:lib",
+    "build": "bun run build:clean && bun run build:cli && bun run build:lib && bun run build:ext && bun run build:web",
     "build:clean": "rm -rf dist",
     "build:cli": "bun build ./src/bin/cli.ts --outdir ./dist/bin --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --minify",
     "build:lib": "bun build ./src/service/index.ts --outdir ./dist/service --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --splitting && bun build ./src/core/index.ts --outdir ./dist/core --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --splitting",
+    "build:ext": "bun build ./src/extensions/pi/adapter.ts --outdir ./dist/extensions/pi --target bun --format esm --external onnxruntime-node --external @lancedb/lancedb --external @mariozechner/pi-coding-agent --external @mariozechner/pi-ai --external @mariozechner/pi-tui --external @sinclair/typebox --minify",
+    "build:web": "cd web && bun install --frozen-lockfile 2>/dev/null; bun run build 2>/dev/null || echo 'web build skipped'",
     "prepublishOnly": "bun run build",
     "cli": "bun src/bin/cli.ts",
     "daemon": "bun src/bin/daemon.ts",
     "mcp": "bun src/transport/mcp-server.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:cline": "bun build ./src/extensions/cline/adapter.ts --outdir ./dist/extensions/cline --target bun --format esm --external @cline/sdk --external onnxruntime-node --external @lancedb/lancedb --minify"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@sinclair/typebox": "^0.34.38"
   },
   "devDependencies": {
     "@types/bun": "latest",
@@ -90,7 +116,8 @@
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-tui": "*"
+    "@mariozechner/pi-tui": "*",
+    "@cline/sdk": "*"
   },
   "peerDependenciesMeta": {
     "@mariozechner/pi-coding-agent": {
@@ -101,6 +128,22 @@
     },
     "@mariozechner/pi-tui": {
       "optional": true
+    },
+    "@cline/sdk": {
+      "optional": true
     }
+  },
+  "cline": {
+    "plugins": [
+      {
+        "paths": [
+          "./src/extensions/cline/plugin.ts"
+        ],
+        "capabilities": [
+          "tools",
+          "hooks"
+        ]
+      }
+    ]
   }
 }

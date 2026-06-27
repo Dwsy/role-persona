@@ -176,3 +176,89 @@ export function buildScenarioPromptBlock(matches: MemoryScenarioSearchMatch[]): 
 
   return [`## Scenario Memory Hints`, ...blocks].join("\n\n");
 }
+
+// ============================================================================
+// Auto-Trigger: Analyze conversation and suggest relevant scenarios
+// ============================================================================
+
+export interface ScenarioTriggerResult {
+  /** Whether any scenarios were triggered */
+  triggered: boolean;
+  /** Matched scenarios */
+  scenarios: MemoryScenarioSearchMatch[];
+  /** Formatted prompt block for injection */
+  promptBlock: string;
+  /** Confidence score (0-1) */
+  confidence: number;
+}
+
+/**
+ * Analyze a conversation and detect if any scenarios should be triggered.
+ * This is designed to be called at the start of a conversation turn.
+ */
+export function detectScenarioTriggers(
+  rolePath: string,
+  messages: Array<{ role: string; content?: string }>,
+  opts?: {
+    limit?: number;
+    minScore?: number;
+    maxMessages?: number;
+  },
+): ScenarioTriggerResult {
+  const limit = opts?.limit ?? 3;
+  const minScore = opts?.minScore ?? 0.3;
+  const maxMessages = opts?.maxMessages ?? 5;
+
+  // Build query from recent messages
+  const recentMessages = messages
+    .filter(m => m.role === "user")
+    .slice(-maxMessages);
+
+  if (recentMessages.length === 0) {
+    return { triggered: false, scenarios: [], promptBlock: "", confidence: 0 };
+  }
+
+  // Combine recent user messages for better context
+  const query = recentMessages
+    .map(m => m.content || "")
+    .join(" ");
+
+  if (query.length < 5) {
+    return { triggered: false, scenarios: [], promptBlock: "", confidence: 0 };
+  }
+
+  // Search for matching scenarios
+  const matches = searchMemoryScenarios(rolePath, query, limit, minScore);
+
+  if (matches.length === 0) {
+    return { triggered: false, scenarios: [], promptBlock: "", confidence: 0 };
+  }
+
+  // Calculate overall confidence
+  const avgScore = matches.reduce((sum, m) => sum + m.score, 0) / matches.length;
+  const confidence = Math.min(avgScore * 1.5, 1); // Scale up but cap at 1
+
+  // Build prompt block
+  const promptBlock = buildScenarioPromptBlock(matches);
+
+  return {
+    triggered: true,
+    scenarios: matches,
+    promptBlock,
+    confidence,
+  };
+}
+
+/**
+ * Quick check: should we inject scenario context?
+ * Returns true if the conversation likely needs scenario context.
+ */
+export function shouldInjectScenarioContext(
+  rolePath: string,
+  query: string,
+): boolean {
+  if (!query || query.length < 5) return false;
+
+  const matches = searchMemoryScenarios(rolePath, query, 1, 0.4);
+  return matches.length > 0;
+}

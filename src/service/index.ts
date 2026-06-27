@@ -11,7 +11,7 @@
  *   service.knowledge.search("design patterns")
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -256,6 +256,19 @@ export function createService(options: ServiceOptions = {}): RolePersonaService 
         `- memory → ${rolePath}/memory/consolidated.md`,
         `- daily → ${rolePath}/memory/daily/${today}.md`,
       ].join("\n");
+
+      if (ctx.activeRole.isFirstRun) {
+        const bootstrapPath = join(rolePath, "BOOTSTRAP.md");
+        const bootstrap = existsSync(bootstrapPath)
+          ? readFileSync(bootstrapPath, "utf-8")
+          : "BOOTSTRAP.md is missing. Initialize the role core files conservatively.";
+
+        return [
+          basePrompt,
+          fileLocation,
+          `## [FIRST RUN] FIRST RUN - BOOTSTRAP\n\n${bootstrap}\n\n---\n\nFollow the BOOTSTRAP.md guidance above. After initialization is complete, delete BOOTSTRAP.md.`,
+        ].join("\n\n");
+      }
 
       // ── Memory edit instruction ──
       const editInstruction = memoryService.buildEditInstruction();

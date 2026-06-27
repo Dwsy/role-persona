@@ -9,7 +9,7 @@ const CWD = process.cwd();
 const TEST_ROLE = "test-cli-integration";
 
 async function run(args: string[]) {
-  return cli(args, { cwd: CWD, timeoutMs: 30000 });
+  return cli([...args, "--direct"], { cwd: CWD, timeoutMs: 30000 });
 }
 
 describe("CLI", () => {

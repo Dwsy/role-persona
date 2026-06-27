@@ -155,11 +155,15 @@ function mapArgsToEndpoint(args: string[]): { path: string; body: Record<string,
  */
 export async function cli(args: string[], opts: CliOptions = {}): Promise<CliResult> {
   const timeout = opts.timeoutMs || 10000;
+  const direct = args.includes("--direct");
 
   // Try daemon HTTP (auto-start if needed)
-  let port = daemonPort();
-  if (!port) {
-    port = await ensureDaemon();
+  let port: number | null = null;
+  if (!direct) {
+    port = daemonPort();
+    if (!port) {
+      port = await ensureDaemon();
+    }
   }
 
   if (port) {
@@ -184,7 +188,8 @@ export async function cli(args: string[], opts: CliOptions = {}): Promise<CliRes
   }
 
   // Fallback: subprocess
-  const allArgs = [CLI_PATH, ...args, "--direct"];
+  const runArgs = direct ? args : [...args, "--direct"];
+  const allArgs = [CLI_PATH, ...runArgs];
   if (opts.cwd) allArgs.push("--cwd", opts.cwd);
 
   return new Promise((resolve, reject) => {

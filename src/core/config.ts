@@ -100,6 +100,7 @@ export interface VectorMemoryConfig {
   /** all-MiniLM-L6-v2 specific configuration (provider=minilm-*) */
   minilm?: MiniLMConfig;
   autoRecall: boolean;
+  smartRecall?: boolean;
   autoIndex: boolean;
   recallLimit: number;
   recallMinScore: number;
@@ -224,6 +225,7 @@ const DEFAULT_CONFIG: RolePersonaConfig = {
       useGPU: false,
     },
     autoRecall: true,
+    smartRecall: true,
     autoIndex: true,
     hybridSearch: true,
     vectorWeight: 1.0,

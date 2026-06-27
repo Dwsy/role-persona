@@ -91,6 +91,121 @@ function hashId(type: string, text: string, extra = ""): string {
     .slice(0, 10);
 }
 
+// ============================================================================
+// Semantic Deduplication
+// ============================================================================
+
+/**
+ * Calculate text similarity using simple token overlap.
+ * Returns a score between 0 (no overlap) and 1 (identical).
+ */
+export function textSimilarity(a: string, b: string): number {
+  const tokenize = (s: string): Set<string> => {
+    // Split by whitespace and punctuation, lowercase
+    // Also split Chinese characters individually for better matching
+    const tokens = new Set<string>();
+    const words = s.toLowerCase().split(/[\s,\.!?;:，。！？；：]+/).filter(Boolean);
+    
+    for (const word of words) {
+      tokens.add(word);
+      // Add individual Chinese characters (2-3 char ngrams)
+      if (/[\u4e00-\u9fa5]/.test(word)) {
+        for (let i = 0; i < word.length; i++) {
+          if (/[\u4e00-\u9fa5]/.test(word[i])) {
+            tokens.add(word[i]);
+            if (i + 1 < word.length && /[\u4e00-\u9fa5]/.test(word[i + 1])) {
+              tokens.add(word.slice(i, i + 2));
+            }
+          }
+        }
+      }
+    }
+    
+    return tokens;
+  };
+
+  const tokensA = tokenize(a);
+  const tokensB = tokenize(b);
+
+  if (tokensA.size === 0 && tokensB.size === 0) return 1;
+  if (tokensA.size === 0 || tokensB.size === 0) return 0;
+
+  // Jaccard similarity
+  let intersection = 0;
+  for (const token of tokensA) {
+    if (tokensB.has(token)) intersection++;
+  }
+
+  const union = tokensA.size + tokensB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+/**
+ * Find potential duplicates based on text similarity.
+ * Returns matches sorted by similarity score (highest first).
+ */
+export function findPotentialDuplicates(
+  text: string,
+  existing: Array<{ id: string; text: string; category?: string }>,
+  threshold: number = 0.6,
+): Array<{ id: string; text: string; similarity: number; category?: string }> {
+  const normalized = normalizeText(text).toLowerCase();
+  
+  const matches: Array<{ id: string; text: string; similarity: number; category?: string }> = [];
+  
+  for (const item of existing) {
+    const itemNormalized = normalizeText(item.text).toLowerCase();
+    
+    // Quick exact match check
+    if (normalized === itemNormalized) {
+      matches.push({ id: item.id, text: item.text, similarity: 1, category: item.category });
+      continue;
+    }
+    
+    // Semantic similarity check
+    const similarity = textSimilarity(text, item.text);
+    if (similarity >= threshold) {
+      matches.push({ id: item.id, text: item.text, similarity, category: item.category });
+    }
+  }
+  
+  return matches.sort((a, b) => b.similarity - a.similarity);
+}
+
+/**
+ * Smart deduplication: check if new text is a duplicate of existing memories.
+ * Returns the duplicate entry if found, null otherwise.
+ */
+export function smartDedup(
+  rolePath: string,
+  roleName: string,
+  text: string,
+  threshold: number = 0.6,
+): { isDuplicate: boolean; duplicateId?: string; duplicateText?: string; similarity?: number } {
+  const data = readRoleMemory(rolePath, roleName);
+  
+  // Combine learnings and preferences for comparison
+  const existing = [
+    ...data.learnings.map(l => ({ id: l.id, text: l.text })),
+    ...data.preferences.map(p => ({ id: p.id, text: p.text })),
+  ];
+  
+  const matches = findPotentialDuplicates(text, existing, threshold);
+  
+  if (matches.length === 0) {
+    return { isDuplicate: false };
+  }
+  
+  // Return the best match
+  const best = matches[0];
+  return {
+    isDuplicate: true,
+    duplicateId: best.id,
+    duplicateText: best.text,
+    similarity: best.similarity,
+  };
+}
+
 function memoryRootDir(rolePath: string): string {
   return join(rolePath, "memory");
 }
@@ -362,6 +477,62 @@ function tokenize(text: string): Set<string> {
       .split(/\s+/)
       .filter((t) => t.length >= 2)
   );
+}
+
+// ============================================================================
+// Fuzzy Matching & Chinese Support
+// ============================================================================
+
+/**
+ * Generate n-grams for Chinese text matching.
+ */
+function generateNgrams(text: string, n: number = 2): Set<string> {
+  const ngrams = new Set<string>();
+  const cleanText = text.replace(/[^\u4e00-\u9fa5a-z0-9]/gi, "");
+  
+  for (let i = 0; i <= cleanText.length - n; i++) {
+    ngrams.add(cleanText.slice(i, i + n));
+  }
+  
+  return ngrams;
+}
+
+/**
+ * Calculate fuzzy similarity between two strings.
+ * Supports Chinese characters via n-gram matching.
+ */
+export function fuzzySimilarity(a: string, b: string): number {
+  const aLower = a.toLowerCase();
+  const bLower = b.toLowerCase();
+  
+  // Exact match
+  if (aLower === bLower) return 1;
+  
+  // Substring match
+  if (bLower.includes(aLower) || aLower.includes(bLower)) {
+    return 0.8;
+  }
+  
+  // N-gram similarity for Chinese
+  const aNgrams = generateNgrams(aLower, 2);
+  const bNgrams = generateNgrams(bLower, 2);
+  
+  if (aNgrams.size === 0 || bNgrams.size === 0) return 0;
+  
+  let intersection = 0;
+  for (const ng of aNgrams) {
+    if (bNgrams.has(ng)) intersection++;
+  }
+  
+  const union = aNgrams.size + bNgrams.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+/**
+ * Check if query matches candidate with fuzzy matching.
+ */
+function fuzzyMatch(query: string, candidate: string, threshold: number = 0.3): boolean {
+  return fuzzySimilarity(query, candidate) >= threshold;
 }
 
 function jaccard(a: Set<string>, b: Set<string>): number {
@@ -966,12 +1137,177 @@ export function appendDailyRoleMemory(
   log("daily-memory", `[${category}] ${text.slice(0, 120)}`);
 }
 
+// ============================================================================
+// Daily Summary: Generate summary from daily memory
+// ============================================================================
+
+export interface DailySummaryResult {
+  date: string;
+  totalEntries: number;
+  lessons: string[];
+  events: string[];
+  preferences: string[];
+  summary: string;
+  appendedToConsolidated: boolean;
+}
+
+/**
+ * Parse daily memory file and extract categorized entries.
+ */
+export function parseDailyMemory(rolePath: string, date: string): {
+  lessons: string[];
+  events: string[];
+  preferences: string[];
+  contexts: string[];
+  decisions: string[];
+  total: number;
+} {
+  const path = dailyMemoryPath(rolePath, date);
+  if (!existsSync(path)) {
+    return { lessons: [], events: [], preferences: [], contexts: [], decisions: [], total: 0 };
+  }
+
+  const content = readFileSync(path, "utf-8");
+  const sections = content.split(/^## \[/m).filter(Boolean);
+
+  const lessons: string[] = [];
+  const events: string[] = [];
+  const preferences: string[] = [];
+  const contexts: string[] = [];
+  const decisions: string[] = [];
+
+  for (const section of sections) {
+    const match = section.match(/^\d{2}:\d{2}\] (\w+)\n\n([\s\S]*?)$/);
+    if (!match) continue;
+
+    const [, type, body] = match;
+    const text = body.trim().split("\n")[0]; // First line only
+
+    switch (type) {
+      case "LESSON":
+        lessons.push(text);
+        break;
+      case "EVENT":
+        events.push(text);
+        break;
+      case "PREFERENCE":
+        preferences.push(text);
+        break;
+      case "CONTEXT":
+        contexts.push(text);
+        break;
+      case "DECISION":
+        decisions.push(text);
+        break;
+    }
+  }
+
+  return {
+    lessons,
+    events,
+    preferences,
+    contexts,
+    decisions,
+    total: lessons.length + events.length + preferences.length + contexts.length + decisions.length,
+  };
+}
+
+/**
+ * Generate a summary of daily memory.
+ * This is a simple extractive summary (no LLM required).
+ */
+export function generateDailySummary(
+  rolePath: string,
+  date: string = today(),
+  opts?: { maxItems?: number; appendToConsolidated?: boolean }
+): DailySummaryResult {
+  const maxItems = opts?.maxItems ?? 5;
+  const appendToConsolidated = opts?.appendToConsolidated ?? true;
+
+  const parsed = parseDailyMemory(rolePath, date);
+
+  // Build summary
+  const parts: string[] = [];
+
+  if (parsed.lessons.length > 0) {
+    const items = parsed.lessons.slice(0, maxItems);
+    parts.push(`### Lessons Learned\n${items.map((l) => `- ${l}`).join("\n")}`);
+  }
+
+  if (parsed.preferences.length > 0) {
+    const items = parsed.preferences.slice(0, maxItems);
+    parts.push(`### Preferences\n${items.map((p) => `- ${p}`).join("\n")}`);
+  }
+
+  if (parsed.events.length > 0) {
+    const items = parsed.events.slice(0, maxItems);
+    parts.push(`### Events\n${items.map((e) => `- ${e}`).join("\n")}`);
+  }
+
+  if (parsed.decisions.length > 0) {
+    const items = parsed.decisions.slice(0, maxItems);
+    parts.push(`### Decisions\n${items.map((d) => `- ${d}`).join("\n")}`);
+  }
+
+  const summary = parts.join("\n\n") || "No entries found.";
+
+  // Append to consolidated.md
+  let appendedToConsolidated = false;
+  if (appendToConsolidated && parsed.total > 0) {
+    const consolidatedPath = memoryFilePath(rolePath);
+    const consolidatedContent = existsSync(consolidatedPath) ? readFileSync(consolidatedPath, "utf-8") : "";
+
+    // Check if this date summary already exists
+    const summaryHeader = `## [${date}] Daily Summary`;
+    if (!consolidatedContent.includes(summaryHeader)) {
+      const entry = `\n\n${summaryHeader}\n\n${summary}\n`;
+      writeFileSync(consolidatedPath, consolidatedContent + entry, "utf-8");
+      appendedToConsolidated = true;
+      log("daily-summary", `appended summary for ${date} to consolidated.md`);
+    }
+  }
+
+  return {
+    date,
+    totalEntries: parsed.total,
+    lessons: parsed.lessons,
+    events: parsed.events,
+    preferences: parsed.preferences,
+    summary,
+    appendedToConsolidated,
+  };
+}
+
+/**
+ * Summarize multiple days of memory.
+ */
+export function summarizeDateRange(
+  rolePath: string,
+  startDate: string,
+  endDate: string,
+  opts?: { maxItems?: number }
+): DailySummaryResult[] {
+  const results: DailySummaryResult[] = [];
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+
+  for (let d = start; d <= end; d.setDate(d.getDate() + 1)) {
+    const date = d.toISOString().split("T")[0];
+    const result = generateDailySummary(rolePath, date, { ...opts, appendToConsolidated: false });
+    if (result.totalEntries > 0) {
+      results.push(result);
+    }
+  }
+
+  return results;
+}
+
 export function addRoleLearning(
   rolePath: string,
   roleName: string,
   text: string,
-  options?: { source?: string; appendDaily?: boolean; tags?: string[]; weight?: number; usePending?: boolean }
-): { stored: boolean; duplicate?: boolean; id?: string; reason?: string; layer?: string } {
+  options?: { source?: string; appendDaily?: boolean; tags?: string[]; weight?: number; usePending?: boolean; dedupThreshold?: number }
+): { stored: boolean; duplicate?: boolean; id?: string; reason?: string; layer?: string; similarity?: number } {
   const normalized = normalizeText(text);
   if (!normalized || normalized === "(none)") return { stored: false, reason: "empty" };
 
@@ -990,10 +1326,23 @@ export function addRoleLearning(
     return { stored: true, id: result.id, reason: "pending", layer: "pending" };
   }
 
-  const data = readRoleMemory(rolePath, roleName);
-  const duplicate = data.learnings.find((l) => normalizeText(l.text).toLowerCase() === normalized.toLowerCase());
-  if (duplicate) return { stored: false, duplicate: true, id: duplicate.id, reason: "duplicate", layer: "consolidated" };
+  // Smart deduplication: check for semantic duplicates
+  const dedupThreshold = options?.dedupThreshold ?? 0.7;
+  const dedupResult = smartDedup(rolePath, roleName, normalized, dedupThreshold);
+  
+  if (dedupResult.isDuplicate) {
+    log("memory-dedup", `semantic duplicate detected: ${dedupResult.similarity?.toFixed(2)} similarity with ${dedupResult.duplicateId}`);
+    return {
+      stored: false,
+      duplicate: true,
+      id: dedupResult.duplicateId,
+      reason: "semantic_duplicate",
+      similarity: dedupResult.similarity,
+      layer: "consolidated",
+    };
+  }
 
+  const data = readRoleMemory(rolePath, roleName);
   data.learnings.push({
     id: hashId("learning", normalized),
     text: normalized,
@@ -1111,8 +1460,123 @@ export function reinforceRoleLearning(
   if (!fuzzy) return { updated: false };
 
   fuzzy.used += 1;
+  fuzzy.lastAccessed = today();
   saveRoleMemory(rolePath, data);
   return { updated: true, id: fuzzy.id, used: fuzzy.used, text: fuzzy.text };
+}
+
+// ============================================================================
+// Memory Usage Statistics
+// ============================================================================
+
+export interface MemoryUsageStats {
+  /** Total number of learnings */
+  totalLearnings: number;
+  /** Total number of preferences */
+  totalPreferences: number;
+  /** Total usage count across all learnings */
+  totalUsage: number;
+  /** Most used learnings (top N) */
+  mostUsed: Array<{ id: string; text: string; used: number; lastAccessed?: string }>;
+  /** Recently accessed learnings */
+  recentlyAccessed: Array<{ id: string; text: string; used: number; lastAccessed?: string }>;
+  /** Never used learnings */
+  neverUsed: Array<{ id: string; text: string }>;
+  /** Usage distribution */
+  usageDistribution: {
+    unused: number;
+    low: number;     // 1-5 uses
+    medium: number;  // 6-20 uses
+    high: number;    // 21+ uses
+  };
+  /** Average usage per learning */
+  avgUsage: number;
+}
+
+/**
+ * Get memory usage statistics.
+ */
+export function getMemoryUsageStats(
+  rolePath: string,
+  roleName: string,
+  opts?: { topN?: number }
+): MemoryUsageStats {
+  const topN = opts?.topN ?? 10;
+  const data = readRoleMemory(rolePath, roleName);
+
+  // Sort by usage
+  const sortedByUsage = [...data.learnings].sort((a, b) => (b.used || 0) - (a.used || 0));
+
+  // Sort by last accessed
+  const sortedByAccess = [...data.learnings]
+    .filter(l => l.lastAccessed)
+    .sort((a, b) => (b.lastAccessed || "").localeCompare(a.lastAccessed || ""));
+
+  // Calculate usage distribution
+  const usageDistribution = {
+    unused: 0,
+    low: 0,
+    medium: 0,
+    high: 0,
+  };
+
+  for (const learning of data.learnings) {
+    const used = learning.used || 0;
+    if (used === 0) usageDistribution.unused++;
+    else if (used <= 5) usageDistribution.low++;
+    else if (used <= 20) usageDistribution.medium++;
+    else usageDistribution.high++;
+  }
+
+  // Calculate average usage
+  const totalUsage = data.learnings.reduce((sum, l) => sum + (l.used || 0), 0);
+  const avgUsage = data.learnings.length > 0 ? totalUsage / data.learnings.length : 0;
+
+  return {
+    totalLearnings: data.learnings.length,
+    totalPreferences: data.preferences.length,
+    totalUsage,
+    mostUsed: sortedByUsage.slice(0, topN).map(l => ({
+      id: l.id,
+      text: l.text,
+      used: l.used || 0,
+      lastAccessed: l.lastAccessed,
+    })),
+    recentlyAccessed: sortedByAccess.slice(0, topN).map(l => ({
+      id: l.id,
+      text: l.text,
+      used: l.used || 0,
+      lastAccessed: l.lastAccessed,
+    })),
+    neverUsed: data.learnings
+      .filter(l => !l.used || l.used === 0)
+      .slice(0, topN)
+      .map(l => ({ id: l.id, text: l.text })),
+    usageDistribution,
+    avgUsage,
+  };
+}
+
+/**
+ * Update usage stats when a memory is accessed.
+ */
+export function updateMemoryUsage(
+  rolePath: string,
+  roleName: string,
+  id: string
+): { updated: boolean; used?: number } {
+  const data = readRoleMemory(rolePath, roleName);
+  const learning = data.learnings.find(l => l.id === id);
+
+  if (!learning) {
+    return { updated: false };
+  }
+
+  learning.used = (learning.used || 0) + 1;
+  learning.lastAccessed = today();
+  saveRoleMemory(rolePath, data);
+
+  return { updated: true, used: learning.used };
 }
 
 export function updateRoleLearning(
@@ -1234,18 +1698,22 @@ function scoreMatch(queryLower: string, queryTokens: Set<string>, candidateLower
     score += 0.5;
   }
 
-  // 2. Token overlap (Jaccard similarity)
+  // 2. Fuzzy similarity (Chinese n-gram support)
+  const fuzzyScore = fuzzySimilarity(queryLower, candidateLower);
+  score += fuzzyScore * 0.3;
+
+  // 3. Token overlap (Jaccard similarity)
   const candidateTokens = tokenize(candidateLower);
   const jaccardScore = jaccard(queryTokens, candidateTokens);
-  score += jaccardScore * 0.3;
+  score += jaccardScore * 0.2;
 
-  // 3. Individual token hits (partial match)
+  // 4. Individual token hits (partial match)
   if (queryTokens.size > 0) {
     let hits = 0;
     for (const qt of queryTokens) {
       if (candidateLower.includes(qt)) hits++;
     }
-    score += (hits / queryTokens.size) * 0.2;
+    score += (hits / queryTokens.size) * 0.1;
   }
 
   return Math.min(1, score);
@@ -2160,28 +2628,233 @@ export function readDailyMemories(rolePath: string): Array<{ text: string; date:
 }
 
 function generateFallbackHtml(data: MemoryExportData): string {
+  // Calculate usage stats
+  const totalUsage = data.learnings.reduce((sum, l) => sum + (l.used || 0), 0);
+  const avgUsage = data.learnings.length > 0 ? (totalUsage / data.learnings.length).toFixed(1) : '0';
+  const highPriority = data.learnings.filter(l => (l.used || 0) >= 3).length;
+  const neverUsed = data.learnings.filter(l => !l.used || l.used === 0).length;
+
+  // Group learnings by usage
+  const highUsage = data.learnings.filter(l => (l.used || 0) >= 5);
+  const mediumUsage = data.learnings.filter(l => (l.used || 0) >= 1 && (l.used || 0) < 5);
+  const lowUsage = data.learnings.filter(l => !l.used || l.used === 0);
+
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><title>${data.title}</title>
-<style>body{font-family:system-ui;max-width:900px;margin:2rem auto;padding:1rem;background:#fff;color:#1e293b}
-h1{color:#6366f1}h2{margin-top:2rem;border-bottom:1px solid #e2e8f0;padding-bottom:0.5rem}
-.card{border:1px solid #e2e8f0;border-radius:8px;padding:1rem;margin:1rem 0}
-.tag{background:#f1f5f9;padding:0.2rem 0.5rem;border-radius:4px;font-size:0.8rem;margin-right:0.3rem}
-.stats{display:flex;gap:2rem;margin:1rem 0}.stat{text-align:center}.stat-value{font-size:2rem;font-weight:bold;color:#6366f1}
+<style>
+  body{font-family:system-ui;max-width:1000px;margin:2rem auto;padding:1rem;background:#f8fafc;color:#1e293b}
+  h1{color:#6366f1;border-bottom:2px solid #6366f1;padding-bottom:0.5rem}
+  h2{margin-top:2rem;color:#475569;border-bottom:1px solid #e2e8f0;padding-bottom:0.3rem}
+  h3{margin-top:1.5rem;color:#64748b}
+  .stats{display:flex;gap:1.5rem;margin:1.5rem 0;flex-wrap:wrap}
+  .stat{background:white;border:1px solid #e2e8f0;border-radius:12px;padding:1rem 1.5rem;text-align:center;min-width:100px}
+  .stat-value{font-size:2rem;font-weight:bold;color:#6366f1}
+  .stat-label{font-size:0.85rem;color:#94a3b8;margin-top:0.3rem}
+  .card{background:white;border:1px solid #e2e8f0;border-radius:8px;padding:1rem;margin:0.8rem 0;transition:box-shadow 0.2s}
+  .card:hover{box-shadow:0 2px 8px rgba(0,0,0,0.1)}
+  .tag{background:#f1f5f9;padding:0.2rem 0.5rem;border-radius:4px;font-size:0.8rem;margin-right:0.3rem;color:#6366f1}
+  .tag-cloud{display:flex;flex-wrap:wrap;gap:0.5rem;margin:1rem 0}
+  .tag-item{background:#e0e7ff;padding:0.4rem 0.8rem;border-radius:20px;font-size:0.85rem}
+  .badge{display:inline-block;padding:0.2rem 0.6rem;border-radius:12px;font-size:0.75rem;font-weight:500}
+  .badge-high{background:#dcfce7;color:#166534}
+  .badge-medium{background:#fef3c7;color:#92400e}
+  .badge-low{background:#f1f5f9;color:#64748b}
+  .empty-state{text-align:center;padding:2rem;color:#94a3b8}
+  small{color:#94a3b8}
 </style></head>
 <body>
 <h1>🧠 ${data.title}</h1>
-<p>${data.generatedAt}</p>
+<p>Generated: ${data.generatedAt} | Last Updated: ${data.updatedAt}</p>
+
 <div class="stats">
-  <div class="stat"><div class="stat-value">${data.learnings.length}</div><div>Learnings</div></div>
-  <div class="stat"><div class="stat-value">${data.preferences.length}</div><div>Preferences</div></div>
-  <div class="stat"><div class="stat-value">${data.daily.length}</div><div>Daily</div></div>
+  <div class="stat"><div class="stat-value">${data.learnings.length}</div><div class="stat-label">Learnings</div></div>
+  <div class="stat"><div class="stat-value">${data.preferences.length}</div><div class="stat-label">Preferences</div></div>
+  <div class="stat"><div class="stat-value">${data.daily.length}</div><div class="stat-label">Daily Notes</div></div>
+  <div class="stat"><div class="stat-value">${avgUsage}</div><div class="stat-label">Avg Usage</div></div>
+  <div class="stat"><div class="stat-value">${highPriority}</div><div class="stat-label">High Priority</div></div>
 </div>
-<h2>💡 Learnings</h2>
-${data.learnings.map(l=>`<div class="card"><p>${l.text}</p>${l.tags?.map(t=>`<span class="tag">#${t}</span>`).join('')||''}<small> Used: ${l.used}</small></div>`).join('')}
-<h2>⚙️ Preferences</h2>
-${data.preferences.map(p=>`<div class="card"><strong>[${p.category}]</strong><p>${p.text}</p></div>`).join('')}
-<h2>📝 Daily</h2>
-${data.daily.slice(0,20).map(d=>`<div class="card"><small>${d.date} ${d.time||''}</small><p>${d.text}</p></div>`).join('')}
+
+<h2>📊 Usage Overview</h2>
+<div class="stats">
+  <div class="stat"><div class="stat-value">${highUsage.length}</div><div class="stat-label">High Usage (5+)</div></div>
+  <div class="stat"><div class="stat-value">${mediumUsage.length}</div><div class="stat-label">Medium (1-4)</div></div>
+  <div class="stat"><div class="stat-value">${neverUsed}</div><div class="stat-label">Never Used</div></div>
+</div>
+
+<h2>🏷️ Tags</h2>
+<div class="tag-cloud">
+${data.tags.length > 0 ? data.tags.map(t => `<span class="tag-item">${t.name} (${t.count})</span>`).join('\n') : '<div class="empty-state">No tags yet</div>'}
+</div>
+
+<h2>💡 Learnings (${data.learnings.length})</h2>
+${highUsage.length > 0 ? `<h3>🔥 High Usage</h3>${highUsage.map(l => `<div class="card"><span class="badge badge-high">Used ${l.used}x</span><p>${l.text}</p>${l.tags?.map(t => `<span class="tag">#${t}</span>`).join('') || ''}</div>`).join('\n')}` : ''}
+${mediumUsage.length > 0 ? `<h3>📝 Medium Usage</h3>${mediumUsage.map(l => `<div class="card"><span class="badge badge-medium">Used ${l.used}x</span><p>${l.text}</p>${l.tags?.map(t => `<span class="tag">#${t}</span>`).join('') || ''}</div>`).join('\n')}` : ''}
+${lowUsage.length > 0 ? `<h3>📌 Low/No Usage</h3>${lowUsage.map(l => `<div class="card"><span class="badge badge-low">Used ${l.used || 0}x</span><p>${l.text}</p></div>`).join('\n')}` : ''}
+
+<h2>⚙️ Preferences (${data.preferences.length})</h2>
+${data.preferences.length > 0 ? data.preferences.map(p => `<div class="card"><strong>[${p.category}]</strong><p>${p.text}</p></div>`).join('\n') : '<div class="empty-state">No preferences yet</div>'}
+
+<h2>📝 Daily Notes (${data.daily.length})</h2>
+${data.daily.length > 0 ? data.daily.slice(0, 20).map(d => `<div class="card"><small>${d.date} ${d.time || ''}</small><p>${d.text}</p></div>`).join('\n') : '<div class="empty-state">No daily notes yet</div>'}
+
+${data.pending.length > 0 ? `<h2>⏳ Pending (${data.pending.length})</h2>${data.pending.map(p => `<div class="card"><small>${p.source} | ${p.createdAt}</small><p>${p.text}</p></div>`).join('\n')}` : ''}
+
 </body></html>`;
+}
+
+// ============================================================================
+// Multi-format Export
+// ============================================================================
+
+export type ExportFormat = "html" | "json" | "markdown";
+
+export interface ExportOptions {
+  format: ExportFormat;
+  includeDaily?: boolean;
+  includePending?: boolean;
+  maxItems?: number;
+}
+
+/**
+ * Export memory to JSON format.
+ */
+export function exportMemoryToJson(
+  rolePath: string,
+  roleName: string,
+  opts?: { includeDaily?: boolean; includePending?: boolean }
+): string {
+  const data = readRoleMemory(rolePath, roleName);
+  const dailyMemories = opts?.includeDaily !== false ? readDailyMemories(rolePath) : [];
+  const pendingData = opts?.includePending !== false ? getPendingMemories(rolePath) : [];
+
+  const exportData = {
+    roleName,
+    exportedAt: new Date().toISOString(),
+    learnings: data.learnings.map(l => ({
+      id: l.id,
+      text: l.text,
+      used: l.used,
+      tags: l.tags,
+      source: l.source,
+      lastAccessed: l.lastAccessed,
+    })),
+    preferences: data.preferences.map(p => ({
+      id: p.id,
+      category: p.category,
+      text: p.text,
+      tags: p.tags,
+    })),
+    events: data.events,
+    daily: dailyMemories,
+    pending: pendingData.filter(p => !p.discarded),
+    stats: {
+      totalLearnings: data.learnings.length,
+      totalPreferences: data.preferences.length,
+      totalEvents: data.events.length,
+      totalDaily: dailyMemories.length,
+      totalPending: pendingData.filter(p => !p.discarded).length,
+    },
+  };
+
+  return JSON.stringify(exportData, null, 2);
+}
+
+/**
+ * Export memory to Markdown format.
+ */
+export function exportMemoryToMarkdown(
+  rolePath: string,
+  roleName: string,
+  opts?: { includeDaily?: boolean; includePending?: boolean; maxItems?: number }
+): string {
+  const data = readRoleMemory(rolePath, roleName);
+  const dailyMemories = opts?.includeDaily !== false ? readDailyMemories(rolePath) : [];
+  const pendingData = opts?.includePending !== false ? getPendingMemories(rolePath) : [];
+  const maxItems = opts?.maxItems ?? 50;
+
+  const lines: string[] = [];
+  lines.push(`# Memory Export: ${roleName}`);
+  lines.push("");
+  lines.push(`Exported at: ${new Date().toLocaleString("zh-CN")}`);
+  lines.push("");
+
+  // Stats
+  lines.push("## 📊 Statistics");
+  lines.push("");
+  lines.push(`- Learnings: ${data.learnings.length}`);
+  lines.push(`- Preferences: ${data.preferences.length}`);
+  lines.push(`- Events: ${data.events.length}`);
+  lines.push(`- Daily Notes: ${dailyMemories.length}`);
+  lines.push("");
+
+  // High priority learnings
+  const highPriority = data.learnings.filter(l => (l.used || 0) >= 3);
+  if (highPriority.length > 0) {
+    lines.push("## 🔥 High Priority Learnings");
+    lines.push("");
+    for (const l of highPriority.slice(0, maxItems)) {
+      lines.push(`- [${l.used}x] ${l.text}`);
+    }
+    lines.push("");
+  }
+
+  // All learnings
+  lines.push(`## 💡 Learnings (${data.learnings.length})`);
+  lines.push("");
+  for (const l of data.learnings.slice(0, maxItems)) {
+    const tags = l.tags?.length ? ` #${l.tags.join(" #")}` : "";
+    lines.push(`- [${l.used || 0}x] ${l.text}${tags}`);
+  }
+  lines.push("");
+
+  // Preferences
+  lines.push(`## ⚙️ Preferences (${data.preferences.length})`);
+  lines.push("");
+  for (const p of data.preferences.slice(0, maxItems)) {
+    lines.push(`- [${p.category}] ${p.text}`);
+  }
+  lines.push("");
+
+  // Daily notes
+  if (dailyMemories.length > 0) {
+    lines.push(`## 📝 Daily Notes (${dailyMemories.length})`);
+    lines.push("");
+    for (const d of dailyMemories.slice(0, maxItems)) {
+      lines.push(`- ${d.date} ${d.time || ""}: ${d.text}`);
+    }
+    lines.push("");
+  }
+
+  // Pending
+  if (pendingData.length > 0) {
+    lines.push(`## ⏳ Pending (${pendingData.length})`);
+    lines.push("");
+    for (const p of pendingData.filter(p => !p.discarded).slice(0, maxItems)) {
+      lines.push(`- [${p.source}] ${p.text}`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Export memory to specified format.
+ */
+export function exportMemory(
+  rolePath: string,
+  roleName: string,
+  format: ExportFormat = "html",
+  opts?: ExportOptions
+): string {
+  switch (format) {
+    case "json":
+      return exportMemoryToJson(rolePath, roleName, opts);
+    case "markdown":
+      return exportMemoryToMarkdown(rolePath, roleName, opts);
+    case "html":
+    default:
+      return exportMemoryToHtml(rolePath, roleName);
+  }
 }

@@ -19,10 +19,14 @@ export {
   searchRoleMemory, listRoleMemory, readRoleMemory,
   consolidateRoleMemory, repairRoleMemory, ensureRoleMemoryFiles,
   readMemoryPromptBlocks, loadHighPriorityMemories, loadMemoryOnDemand,
-  buildMemoryEditInstruction, exportMemoryToHtml,
+  buildMemoryEditInstruction, exportMemoryToHtml, exportMemoryToJson, exportMemoryToMarkdown, exportMemory,
   detectMemoryConflicts, getConflictReport,
   getPendingMemories, getPendingStats, promotePendingLearning, expirePendingMemories,
   appendDailyRoleMemory,
+  textSimilarity, findPotentialDuplicates, smartDedup,
+  parseDailyMemory, generateDailySummary, summarizeDateRange, type DailySummaryResult,
+  getMemoryUsageStats, updateMemoryUsage, type MemoryUsageStats,
+  fuzzySimilarity, type ExportFormat, type ExportOptions,
 } from "./memory-md.ts";
 export {
   runAutoMemoryExtraction, runLlmMemoryTidy,
@@ -33,13 +37,19 @@ export {
 export {
   initVectorMemory, isVectorActive, queueVectorIndex, flushVectorIndex,
   disposeVectorMemory, hybridSearch, autoRecall, rebuildVectorIndex, getVectorStats,
+  smartAutoRecall, detectRecallIntent, type RecallIntent,
+  incrementalIndex, batchIncrementalIndex, vectorIndexContains,
+  type IndexAction, type IncrementalIndexResult,
 } from "./memory-vector.ts";
 export {
   ensureMemoryScenarioLayer, writeMemoryScenario, listMemoryScenarios,
   readMemoryScenario, searchMemoryScenarios, buildScenarioPromptBlock,
+  detectScenarioTriggers, shouldInjectScenarioContext, type ScenarioTriggerResult,
 } from "./memory-scenarios.ts";
 export {
   listKnowledge, readKnowledge, searchKnowledge, writeKnowledge,
+  buildKnowledgeTagCloud, formatTagCloudMarkdown, formatTagCloudHtml,
+  type TagCloudItem, type TagCloudResult,
 } from "./knowledge.ts";
 export {
   type EmbeddingProvider,

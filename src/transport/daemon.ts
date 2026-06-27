@@ -21,6 +21,7 @@ import { join, extname } from "node:path";
 import { homedir } from "node:os";
 import { spawn } from "node:child_process";
 import { createService, type RolePersonaService, type ServiceOptions } from "../service/index.ts";
+import { loadConfig } from "../core/config.ts";
 import type { LlmCaller, LlmCompletionResult, ModelRegistry, ModelInfo, ApiKeyResolver } from "../core/types.ts";
 
 // ── Config ──
@@ -177,6 +178,7 @@ function createDaemonModelRegistry(): ModelRegistry {
         baseUrl: prov.baseUrl,
         apiKey: prov.apiKey,
         api: prov.api,
+        reasoning: (m as any).reasoning,
       } as any);
     }
   }
@@ -208,6 +210,32 @@ function createDaemonLlmCaller(): LlmCaller {
       const providerCfg = providers[prov];
       if (!providerCfg) throw new Error(`Provider not found: ${prov}`);
 
+      const isReasoning = !!(model as any).reasoning;
+      const messages: Array<{ role: string; content: string }> = request.messages.map((m) => ({
+        role: m.role,
+        content: m.content.map((c) => c.text).join(""),
+      }));
+
+      // Patch 3: reasoning models need system prompt forcing JSON output
+      if (isReasoning && messages.length > 0 && messages[0].role !== "system") {
+        messages.unshift({
+          role: "system",
+          content: "Output ONLY valid JSON. No explanation, no reasoning, no markdown. Just the JSON object.",
+        });
+      }
+
+      const body: any = {
+        model: model.id,
+        messages,
+        max_tokens: options.maxTokens || 1024,
+      };
+
+      // Patch 4: reasoning models need higher token budget
+      if (isReasoning) {
+        body.reasoning_effort = "low";
+        if (body.max_tokens < 16384) body.max_tokens = 32768;
+      }
+
       const url = `${providerCfg.baseUrl}/chat/completions`;
       const response = await fetch(url, {
         method: "POST",
@@ -215,24 +243,36 @@ function createDaemonLlmCaller(): LlmCaller {
           "Content-Type": "application/json",
           Authorization: `Bearer ${options.apiKey || providerCfg.apiKey}`,
         },
-        body: JSON.stringify({
-          model: model.id,
-          messages: request.messages.map((m) => ({ role: m.role, content: m.content.map((c) => c.text).join("") })),
-          max_tokens: options.maxTokens || 1024,
-        }),
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
         const err = await response.text().catch(() => "unknown");
+        console.error(`[daemon] LLM call failed (${response.status}):`, err);
         throw new Error(`LLM call failed (${response.status}): ${err}`);
       }
 
       const data = await response.json() as any;
       const text = data.choices?.[0]?.message?.content || "";
-      return {
-        content: [{ type: "text", text }],
-        stopReason: data.choices?.[0]?.finish_reason === "stop" ? "stop" : "error",
-      } as LlmCompletionResult;
+      const thinking = (data.choices?.[0]?.message as any)?.reasoning_content || "";
+
+      // Patch 5: thinking content not returned to caller, only text
+      const content: Array<{ type: string; text?: string; thinking?: string }> = [];
+      if (text) {
+        content.push({ type: "text", text });
+      } else if (thinking) {
+        // Fallback: extract JSON from thinking if content is empty
+        const jsonMatch = thinking.match(/(\{[\s\S]*"learnings"[\s\S]*\})/);
+        if (jsonMatch) {
+          content.push({ type: "text", text: jsonMatch[1] });
+        }
+      }
+
+      // Patch 6: finish_reason mapping
+      const finishReason = data.choices?.[0]?.finish_reason || "unknown";
+      const stopReason = ["stop", "length", "tool_calls"].includes(finishReason) ? "stop" : "error";
+
+      return { content, stopReason } as LlmCompletionResult;
     },
 
     convertToLlm(messages: unknown[]) {
@@ -385,7 +425,15 @@ function buildRoutes(mgr: ServiceManager): Map<string, (req: Request) => Promise
   r.set("POST /api/knowledge/write", async (req) => { const b = await readBody<any>(req); const s = await get(b); return b.title ? json({ ok: true, data: s.knowledge.write(b) }) : badRequest("title required"); });
 
   // ── Embedding ──
-  r.set("POST /api/embedding/stats", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.embedding.stats() }); });
+  r.set("POST /api/embedding/stats", async (req) => {
+    const b = await readBody<any>(req);
+    const s = await get(b);
+    const stats = await s.embedding.stats();
+    return json({
+      ok: true,
+      data: stats ?? { enabled: s.getConfig().vectorMemory.enabled, active: false, model: null, dim: null, count: 0, dbPath: null },
+    });
+  });
   r.set("POST /api/embedding/rebuild", async (req) => { const b = await readBody<any>(req); const s = await get(b); return json({ ok: true, data: await s.embedding.rebuild() }); });
 
   // ── File Operations ──
@@ -583,7 +631,9 @@ export function startDaemon(opts: DaemonOptions = {}) {
   }
 
   const port = opts.port ?? DEFAULT_PORT;
+  const config = loadConfig();
   const mgr = new ServiceManager({
+    config,
     llm: createDaemonLlmCaller(),
     modelRegistry: createDaemonModelRegistry(),
     currentModel: null,

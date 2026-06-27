@@ -2,8 +2,8 @@
  * Role Service — role CRUD, mapping, resolution.
  */
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import type {
   ActiveRole,
   RoleConfig,
@@ -34,6 +34,11 @@ import { repairRoleMemory, expirePendingMemories, ensureRoleMemoryFiles } from "
 import { log } from "../core/logger.ts";
 import type { ServiceContext } from "./context.ts";
 
+export interface StructureOptions {
+  recursive?: boolean;
+  maxEntries?: number;
+}
+
 export interface RoleService {
   list(): string[];
   get(): ActiveRole | null;
@@ -44,7 +49,7 @@ export interface RoleService {
   resolve(cwd: string): RoleResolution;
   getIdentity(rolePath: string): RoleIdentity | null;
   getPrompts(rolePath: string): string;
-  getStructure(rolePath: string, subPath?: string): DirectoryListing;
+  getStructure(rolePath: string, subPath?: string, options?: StructureOptions): DirectoryListing;
   loadConfig(): RoleConfig;
   saveConfig(config: RoleConfig): void;
   migrateAll(): MigrationResult;
@@ -150,44 +155,55 @@ export function createRoleService(ctx: ServiceContext): RoleService {
       return loadRolePrompts(rolePath);
     },
 
-    getStructure(rolePath: string, subPath?: string) {
-      const { readdirSync, statSync } = require("node:fs");
-      const { resolve, relative, join: pathJoin } = require("node:path");
-
-      const target = subPath ? pathJoin(rolePath, subPath) : rolePath;
+    getStructure(rolePath: string, subPath?: string, options: StructureOptions = {}) {
+      const requested = (subPath || ".").trim().replace(/^\/+/, "") || ".";
+      const target = requested === "." ? rolePath : join(rolePath, requested);
       const resolvedTarget = resolve(target);
       const resolvedRoot = resolve(rolePath);
 
       // Security: prevent path escape
       const rel = relative(resolvedRoot, resolvedTarget);
-      if (rel.startsWith("..")) {
+      const relParts = rel.split(/[\\/]/).filter(Boolean);
+      if (rel.startsWith("..") || relParts.includes("..")) {
         throw new Error("Path escapes role directory.");
       }
 
       if (!existsSync(resolvedTarget)) {
-        throw new Error(`Path not found: ${subPath || "."}`);
+        throw new Error(`Path not found: ${requested}`);
       }
 
+      const recursive = options.recursive ?? false;
+      const maxEntries = Math.max(1, Math.min(500, Math.floor(options.maxEntries || 200)));
       const st = statSync(resolvedTarget);
       let files: string[] = [];
       if (st.isFile()) {
         files = [resolvedTarget];
       } else {
-        const entries = readdirSync(resolvedTarget, { withFileTypes: true });
-        files = entries
-          .filter((e: any) => e.isFile())
-          .map((e: any) => pathJoin(resolvedTarget, e.name))
-          .sort();
+        const visit = (dir: string) => {
+          if (files.length >= maxEntries) return;
+          const entries = readdirSync(dir, { withFileTypes: true })
+            .sort((a, b) => a.name.localeCompare(b.name));
+          for (const entry of entries) {
+            if (files.length >= maxEntries) break;
+            const full = join(dir, entry.name);
+            if (entry.isFile()) {
+              files.push(full);
+            } else if (recursive && entry.isDirectory()) {
+              visit(full);
+            }
+          }
+        };
+        visit(resolvedTarget);
       }
 
-      const relFiles = files.map((p: string) => relative(resolvedRoot, p) || ".");
+      const relFiles = files.slice(0, maxEntries).map((p: string) => relative(resolvedRoot, p) || ".");
 
       return {
         path: rolePath,
-        base: subPath || ".",
+        base: rel || ".",
         files: relFiles,
         count: relFiles.length,
-        recursive: false,
+        recursive,
       };
     },
 
